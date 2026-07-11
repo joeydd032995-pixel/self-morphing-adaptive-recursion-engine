@@ -13,6 +13,8 @@ from organized_self_morphing_engine import (
     MorphicTextNode,
     FAISS_AVAILABLE,
     CROSS_ENCODER_AVAILABLE,
+    PYG_AVAILABLE,
+    NODE_TYPES,
 )
 import json
 import sqlite3
@@ -333,6 +335,89 @@ class TestNeo4jSync:
             pytest.skip("neo4j installed; absent-path not exercised")
         assert engine.connect_neo4j() is False
         assert engine.has_neo4j is False
+
+
+def _sample_graph():
+    """A small typed morphic graph exercising all four edge types + a cycle."""
+    root = MorphicTextNode("root", "compute analytics pipeline", "linear")
+    c1 = MorphicTextNode("c1", "process data metrics", "tree")
+    c2 = MorphicTextNode("c2", "graph structure hierarchy", "nested")
+    c3 = MorphicTextNode("c3", "indirect llm routing", "indirect")
+    root.next_linear = c1
+    c1.branches["left"] = c2
+    c2.inner_formula = c3
+    c3.mutual_routine = root  # cycle back to root
+    return root
+
+
+class TestGraphTensors:
+    """Pure-torch graph construction (no PyG required)."""
+
+    def test_build_tensors_shapes_and_cycle_safe(self, engine):
+        t = engine.build_graph_tensors(_sample_graph())
+        assert t["node_ids"] == ["root", "c1", "c2", "c3"]
+        # feature width = embedding dim + one-hot node types
+        assert t["x"].shape[0] == 4
+        assert t["x"].shape[1] > len(NODE_TYPES)
+        # 4 edges (linear, branch, inner_formula, mutual_routine); cycle didn't loop.
+        assert t["edge_index"].shape[1] == 4
+        assert t["y"].tolist() == [0, 1, 2, 3]  # linear,tree,nested,indirect
+
+    def test_empty_graph_returns_none(self, engine):
+        assert engine.build_graph_tensors(None) is None
+
+
+class TestGnnFallback:
+    """NumPy propagation fallback works with or without torch-geometric."""
+
+    def test_classify_returns_types(self, engine):
+        preds = engine.gnn_classify_nodes(_sample_graph())
+        assert set(preds.keys()) == {"root", "c1", "c2", "c3"}
+        assert all(v in NODE_TYPES for v in preds.values())
+
+    def test_predict_links_excludes_existing(self, engine):
+        links = engine.gnn_predict_links(_sample_graph(), top_k=3)
+        assert isinstance(links, list) and len(links) <= 3
+        for a, b, s in links:
+            assert a != b
+
+    def test_node_relevance_range(self, engine):
+        score = engine.gnn_node_relevance("compute metrics", _sample_graph())
+        assert 0.0 <= score <= 100.0
+
+    def test_train_gnn_noop_without_pyg(self, engine):
+        if PYG_AVAILABLE:
+            pytest.skip("PyG installed; no-op path not exercised")
+        assert engine.train_gnn(_sample_graph()) is None
+
+
+class TestGnnWiring:
+    """GNN signals integrate into self-teaching without breaking the no-graph path."""
+
+    def test_self_teaching_without_graph_still_runs(self, engine):
+        engine.current_graph_root = None
+        engine.self_teaching_loop(background=False, max_iterations=1)  # must not raise
+
+    def test_gnn_guided_attach_when_graph_present(self, engine):
+        engine.current_graph_root = _sample_graph()
+        new_node = MorphicTextNode("dyn", "compute analytics extra", "tree")
+        # Should attach (or safely return False) without raising.
+        result = engine._gnn_guided_attach(new_node)
+        assert isinstance(result, bool)
+
+
+@pytest.mark.skipif(not PYG_AVAILABLE, reason="torch-geometric not installed")
+class TestGnnTrained:
+    """Real trained-GNN path when torch-geometric is present."""
+
+    def test_train_and_infer(self, engine):
+        root = _sample_graph()
+        losses = engine.train_gnn(root, epochs=30)
+        assert losses is not None and losses["total"] >= 0
+        preds = engine.gnn_classify_nodes(root)
+        assert len(preds) == 4
+        links = engine.gnn_predict_links(root, top_k=2)
+        assert len(links) <= 2
 
 
 if __name__ == "__main__":

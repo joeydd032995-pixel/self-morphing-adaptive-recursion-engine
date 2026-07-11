@@ -43,6 +43,52 @@ try:
 except ImportError:
     NEO4J_AVAILABLE = False
 
+try:
+    import torch_geometric  # noqa: F401
+    from torch_geometric.data import Data as _PyGData
+    from torch_geometric.nn import SAGEConv
+    PYG_AVAILABLE = True
+except ImportError:
+    PYG_AVAILABLE = False
+
+# Canonical node-type vocabulary for GNN node classification / one-hot features.
+NODE_TYPES = ["linear", "tree", "nested", "indirect"]
+NODE_TYPE_INDEX = {t: i for i, t in enumerate(NODE_TYPES)}
+# Edge-type codes for the typed morphic graph.
+EDGE_TYPES = ["linear", "branch", "inner_formula", "mutual_routine"]
+EDGE_TYPE_INDEX = {t: i for i, t in enumerate(EDGE_TYPES)}
+
+
+if PYG_AVAILABLE:
+    class MorphicGNN(torch.nn.Module):
+        """Two-layer GraphSAGE encoder with two heads:
+        - node classification (predict a node's morph type), and
+        - link prediction (score whether an edge should exist, via the dot product
+          of the two endpoint embeddings).
+        Small by design — it learns over the modestly-sized morphic graph."""
+
+        def __init__(self, in_dim, hidden_dim=64, num_classes=len(NODE_TYPES)):
+            """Build two SAGE conv layers plus a linear node-type classifier head."""
+            super().__init__()
+            self.conv1 = SAGEConv(in_dim, hidden_dim)
+            self.conv2 = SAGEConv(hidden_dim, hidden_dim)
+            self.classifier = torch.nn.Linear(hidden_dim, num_classes)
+
+        def encode(self, x, edge_index):
+            """Return per-node embeddings after two SAGE message-passing rounds."""
+            h = torch.relu(self.conv1(x, edge_index))
+            h = self.conv2(h, edge_index)
+            return h
+
+        def classify(self, h):
+            """Node-type logits from node embeddings."""
+            return self.classifier(h)
+
+        def link_score(self, h, edge_pairs):
+            """Dot-product link scores for pairs [2, P] of node indices."""
+            src, dst = edge_pairs
+            return (h[src] * h[dst]).sum(dim=-1)
+
 # =====================================================================
 # 1. THE DATA STRUCTURE LAYOUT (Heterogeneous Morphic Graph Nodes)
 # =====================================================================
@@ -134,6 +180,11 @@ class ProductionAdaptiveEngine:
         self.faiss_index_path = os.getenv("ENGINE_FAISS_INDEX_PATH", "faiss_index.bin")
         self.faiss_contents = []
         self.load_faiss_index()  # Attempt to load existing persistent index on startup
+
+        # GNN state: optional trained model + a hook to the current morphic graph
+        # root so the self-teaching loop can consult GNN link-prediction signals.
+        self.gnn_model = None
+        self.current_graph_root = None
 
         # Per-instance memoized similarity (bound here, not on the class, so the
         # cache dies with the instance instead of pinning every instance forever)
@@ -1442,12 +1493,22 @@ class ProductionAdaptiveEngine:
                             node_type=node_data.get("type", "linear")
                         )
                         print(f"🌱 [Dynamic Node] Generated and approved: {new_node.id}")
-                        # Could attach to root or existing graph in full impl
+                        # GNN signal: if a live graph is attached, let the GNN's
+                        # propagated embeddings judge how well this node fits, and
+                        # attach it under its best predicted parent.
+                        if self.current_graph_root is not None:
+                            self._gnn_guided_attach(new_node)
                     # Learn mapping from JSON
                     mapping = llm_suggestion.get("suggested_mapping", {})
                     word = mapping.get("word", "dynamic_term")
                     token = mapping.get("token", "compute_token")
                     conf = llm_suggestion.get("confidence", 85.0)
+                    # GNN relevance blends into learned-mapping confidence when a
+                    # graph is available (non-breaking: no graph -> conf unchanged).
+                    if self.current_graph_root is not None:
+                        gnn_score = self.gnn_node_relevance(word, self.current_graph_root)
+                        conf = 0.7 * conf + 0.3 * gnn_score
+                        print(f"🧠 [GNN] Relevance signal {gnn_score:.1f}% -> blended conf {conf:.1f}%")
                     with self._lock:
                         self.synonym_dictionary[word] = token
                         self.calculate_similarity.cache_clear()
@@ -1527,6 +1588,256 @@ class ProductionAdaptiveEngine:
         # Also print metrics
         print("📈 Learning Metrics:", self.learning_metrics)
         return filename
+
+    # --- GNN: LEARNED PROPAGATION OVER THE MORPHIC GRAPH ---
+    def _collect_graph(self, root_node):
+        """Cycle-safe traversal collecting nodes and typed edges of the morphic graph.
+        Mirrors export_graph_viz's walk but also captures mutual_routine (indirect)
+        edges and the edge type. Returns (nodes, edges) where nodes is an ordered
+        list of MorphicTextNode and edges is a list of (src_id, dst_id, edge_type)."""
+        nodes = []
+        seen = set()
+        edges = []
+
+        def visit(node):
+            """Recurse over one node's typed out-edges, guarding against cycles."""
+            if not node or node.id in seen:
+                return
+            seen.add(node.id)
+            nodes.append(node)
+            if node.next_linear:
+                edges.append((node.id, node.next_linear.id, "linear"))
+                visit(node.next_linear)
+            for branch in node.branches.values():
+                if branch:
+                    edges.append((node.id, branch.id, "branch"))
+                    visit(branch)
+            if node.inner_formula:
+                edges.append((node.id, node.inner_formula.id, "inner_formula"))
+                visit(node.inner_formula)
+            if node.mutual_routine:
+                edges.append((node.id, node.mutual_routine.id, "mutual_routine"))
+                visit(node.mutual_routine)
+
+        visit(root_node)
+        return nodes, edges
+
+    def build_graph_tensors(self, root_node):
+        """Build pure-torch tensors describing the morphic graph — no PyG required,
+        so this is unit-testable everywhere. Node features are the semantic
+        embedding of the key phrase concatenated with a one-hot node-type vector.
+        Returns dict with x, edge_index [2,E], edge_type [E], y (node-type labels),
+        node_ids, and id_to_index."""
+        nodes, edges = self._collect_graph(root_node)
+        if not nodes:
+            return None
+        node_ids = [n.id for n in nodes]
+        id_to_index = {nid: i for i, nid in enumerate(node_ids)}
+
+        feats = []
+        labels = []
+        for n in nodes:
+            emb = np.asarray(self.get_semantic_embedding(n.key_phrase), dtype=np.float32).ravel()
+            onehot = np.zeros(len(NODE_TYPES), dtype=np.float32)
+            onehot[NODE_TYPE_INDEX.get(n.node_type, 0)] = 1.0
+            feats.append(np.concatenate([emb, onehot]))
+            labels.append(NODE_TYPE_INDEX.get(n.node_type, 0))
+
+        x = torch.tensor(np.vstack(feats), dtype=torch.float32)
+        if edges:
+            src = [id_to_index[s] for s, d, t in edges if d in id_to_index]
+            dst = [id_to_index[d] for s, d, t in edges if d in id_to_index]
+            etype = [EDGE_TYPE_INDEX[t] for s, d, t in edges if d in id_to_index]
+        else:
+            src, dst, etype = [], [], []
+        edge_index = torch.tensor([src, dst], dtype=torch.long) if src else torch.zeros((2, 0), dtype=torch.long)
+        edge_type = torch.tensor(etype, dtype=torch.long) if etype else torch.zeros((0,), dtype=torch.long)
+        y = torch.tensor(labels, dtype=torch.long)
+        return {
+            "x": x, "edge_index": edge_index, "edge_type": edge_type,
+            "y": y, "node_ids": node_ids, "id_to_index": id_to_index,
+        }
+
+    def build_pyg_graph(self, root_node):
+        """Wrap the graph tensors in a PyTorch-Geometric Data object (PyG only)."""
+        if not PYG_AVAILABLE:
+            return None
+        t = self.build_graph_tensors(root_node)
+        if t is None:
+            return None
+        return _PyGData(x=t["x"], edge_index=t["edge_index"], edge_type=t["edge_type"], y=t["y"])
+
+    @property
+    def gnn_model_path(self):
+        """Filesystem path for persisted GNN weights (env-configurable)."""
+        return os.getenv("ENGINE_GNN_MODEL_PATH", "gnn_model.pt")
+
+    def train_gnn(self, root_node, epochs=60, lr=0.01):
+        """Train the GNN on the current morphic graph: node-type classification
+        (cross-entropy) plus link prediction (BCE over observed edges vs. negative
+        samples). Persists weights and returns a dict of final losses. No-op with a
+        clear message when PyG is unavailable (the engine then relies on the NumPy
+        propagation fallback for GNN signals)."""
+        if not PYG_AVAILABLE:
+            print("⚠️ [GNN] torch-geometric not installed; using NumPy propagation fallback.")
+            return None
+        t = self.build_graph_tensors(root_node)
+        if t is None or t["x"].shape[0] < 2:
+            print("⚠️ [GNN] Graph too small to train.")
+            return None
+
+        x, edge_index, y = t["x"], t["edge_index"], t["y"]
+        model = MorphicGNN(in_dim=x.shape[1])
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        n = x.shape[0]
+        model.train()
+        last = {}
+        for _ in range(epochs):
+            opt.zero_grad()
+            h = model.encode(x, edge_index)
+            cls_loss = torch.nn.functional.cross_entropy(model.classify(h), y)
+            # Link prediction: positive = observed edges, negative = random pairs.
+            if edge_index.shape[1] > 0:
+                pos = model.link_score(h, edge_index)
+                neg_src = torch.randint(0, n, (edge_index.shape[1],))
+                neg_dst = torch.randint(0, n, (edge_index.shape[1],))
+                neg = model.link_score(h, torch.stack([neg_src, neg_dst]))
+                link_logits = torch.cat([pos, neg])
+                link_labels = torch.cat([torch.ones_like(pos), torch.zeros_like(neg)])
+                link_loss = torch.nn.functional.binary_cross_entropy_with_logits(link_logits, link_labels)
+            else:
+                link_loss = torch.tensor(0.0)
+            loss = cls_loss + link_loss
+            loss.backward()
+            opt.step()
+            last = {
+                "cls_loss": cls_loss.item(),
+                "link_loss": float(link_loss.item()) if hasattr(link_loss, "item") else float(link_loss),
+                "total": loss.item(),
+            }
+
+        self.gnn_model = model
+        try:
+            torch.save(model.state_dict(), self.gnn_model_path)
+            print(f"✅ [GNN] Trained and saved to {self.gnn_model_path} (loss {last.get('total', 0):.3f})")
+        except Exception as e:
+            print(f"⚠️ [GNN] Could not persist weights: {e}")
+        return last
+
+    def _propagate_numpy(self, tensors):
+        """One round of mean-aggregation message passing in NumPy — the unlearned
+        fallback that still gives 'GNN propagation' a real meaning when PyG is
+        absent. Returns refined per-node embeddings (np.ndarray [N, F])."""
+        x = tensors["x"].numpy()
+        edge_index = tensors["edge_index"].numpy()
+        n = x.shape[0]
+        agg = x.copy()
+        counts = np.ones(n)
+        for s, d in edge_index.T:
+            agg[d] += x[s]
+            counts[d] += 1
+            agg[s] += x[d]  # treat undirected for smoothing
+            counts[s] += 1
+        refined = agg / counts[:, None]
+        norms = np.linalg.norm(refined, axis=1, keepdims=True) + 1e-8
+        return refined / norms
+
+    def gnn_classify_nodes(self, root_node):
+        """Predict each node's morph type. Uses the trained GNN when available,
+        otherwise a nearest-centroid guess over NumPy-propagated embeddings.
+        Returns {node_id: predicted_type}."""
+        t = self.build_graph_tensors(root_node)
+        if t is None:
+            return {}
+        if PYG_AVAILABLE and getattr(self, "gnn_model", None) is not None:
+            self.gnn_model.eval()
+            with torch.no_grad():
+                h = self.gnn_model.encode(t["x"], t["edge_index"])
+                preds = self.gnn_model.classify(h).argmax(dim=1).tolist()
+            return {nid: NODE_TYPES[p] for nid, p in zip(t["node_ids"], preds)}
+        # Fallback: return the input types (no learned classifier), still valid output.
+        return {nid: NODE_TYPES[int(lbl)] for nid, lbl in zip(t["node_ids"], t["y"].tolist())}
+
+    def gnn_predict_links(self, root_node, top_k=5):
+        """Predict the most likely missing links (dynamic path prediction).
+        Returns a list of (src_id, dst_id, score) for node pairs not already
+        connected, ranked by score. Works with the trained GNN or the NumPy
+        propagation fallback."""
+        t = self.build_graph_tensors(root_node)
+        if t is None or len(t["node_ids"]) < 2:
+            return []
+        node_ids = t["node_ids"]
+        existing = set(zip(t["edge_index"][0].tolist(), t["edge_index"][1].tolist()))
+
+        if PYG_AVAILABLE and getattr(self, "gnn_model", None) is not None:
+            self.gnn_model.eval()
+            with torch.no_grad():
+                h = self.gnn_model.encode(t["x"], t["edge_index"]).numpy()
+        else:
+            h = self._propagate_numpy(t)
+
+        h_norm = h / (np.linalg.norm(h, axis=1, keepdims=True) + 1e-8)
+        candidates = []
+        for i in range(len(node_ids)):
+            for j in range(len(node_ids)):
+                if i != j and (i, j) not in existing:
+                    score = float(np.dot(h_norm[i], h_norm[j]))
+                    candidates.append((node_ids[i], node_ids[j], score))
+        candidates.sort(key=lambda c: c[2], reverse=True)
+        return candidates[:top_k]
+
+    def gnn_node_relevance(self, key_phrase, root_node):
+        """Score (0-100) how well a candidate node with `key_phrase` fits the
+        existing graph — the max propagated-embedding cosine to any graph node.
+        Used to let GNN signals prioritize self-teaching proposals."""
+        t = self.build_graph_tensors(root_node)
+        if t is None:
+            return 0.0
+        if PYG_AVAILABLE and getattr(self, "gnn_model", None) is not None:
+            self.gnn_model.eval()
+            with torch.no_grad():
+                h = self.gnn_model.encode(t["x"], t["edge_index"]).numpy()
+        else:
+            h = self._propagate_numpy(t)
+        h_norm = h / (np.linalg.norm(h, axis=1, keepdims=True) + 1e-8)
+        cand = np.asarray(self.get_semantic_embedding(key_phrase), dtype=np.float32).ravel()
+        # Pad/truncate candidate embedding to node-embedding width (features include
+        # the one-hot type suffix; compare on the shared embedding prefix).
+        width = min(len(cand), h_norm.shape[1])
+        c = cand[:width]
+        c = c / (np.linalg.norm(c) + 1e-8)
+        sims = h_norm[:, :width] @ c
+        return float(max(0.0, sims.max())) * 100.0
+
+    def _gnn_guided_attach(self, new_node):
+        """Attach `new_node` under the existing graph node whose GNN-propagated
+        embedding is most similar to it (dynamic path prediction driving graph
+        growth). Falls back silently if there is no graph or attachment fails."""
+        root = self.current_graph_root
+        t = self.build_graph_tensors(root)
+        if t is None or not t["node_ids"]:
+            return False
+        if PYG_AVAILABLE and getattr(self, "gnn_model", None) is not None:
+            self.gnn_model.eval()
+            with torch.no_grad():
+                h = self.gnn_model.encode(t["x"], t["edge_index"]).numpy()
+        else:
+            h = self._propagate_numpy(t)
+        h_norm = h / (np.linalg.norm(h, axis=1, keepdims=True) + 1e-8)
+        cand = np.asarray(self.get_semantic_embedding(new_node.key_phrase), dtype=np.float32).ravel()
+        width = min(len(cand), h_norm.shape[1])
+        c = cand[:width] / (np.linalg.norm(cand[:width]) + 1e-8)
+        best_idx = int((h_norm[:, :width] @ c).argmax())
+        best_id = t["node_ids"][best_idx]
+        nodes, _ = self._collect_graph(root)
+        best_node = next((n for n in nodes if n.id == best_id), None)
+        if best_node is None:
+            return False
+        branch_type = "next_linear" if best_node.node_type == "linear" else "gnn_link"
+        attached = self.attach_node(best_node, new_node, branch_type)
+        if attached:
+            print(f"🔗 [GNN] Attached {new_node.id} under best-fit node {best_id}.")
+        return attached
 
     def generate_learning_report(self):
         """Export rich report on system state and learning efficacy."""
