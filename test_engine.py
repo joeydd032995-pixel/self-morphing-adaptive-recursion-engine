@@ -478,5 +478,64 @@ class TestPrometheusEndpoint:
         assert "snapshot" in ok.json()
 
 
+class TestFastAPIProduction:
+    """Phase 5 hardening: JSON-body endpoints, real counts, truthful flags."""
+
+    def _client(self):
+        try:
+            os.environ.setdefault("ENGINE_API_KEY", "test-key")
+            import importlib
+            import fastapi_server
+            importlib.reload(fastapi_server)
+            from fastapi.testclient import TestClient
+            return fastapi_server, TestClient(fastapi_server.app)
+        except Exception as e:
+            pytest.skip(f"fastapi stack unavailable: {e}")
+
+    def test_admin_mapping_accepts_json_body(self):
+        mod, client = self._client()
+        with client:
+            resp = client.post("/admin/mappings",
+                               headers={"X-API-Key": "test-key"},
+                               json={"word": "widget", "concept_token": "data_token"})
+            assert resp.status_code == 200
+            assert resp.json()["word"] == "widget"
+
+    def test_rag_ingest_reports_real_count(self):
+        mod, client = self._client()
+        with client:
+            resp = client.post("/rag/ingest",
+                               headers={"X-API-Key": "test-key"},
+                               json={"documents": [SAMPLE_DOC], "strategy": "fixed"})
+            assert resp.status_code == 200
+            body = resp.json()
+            # Real count from ingest_documents, not the old len(documents)*3 estimate.
+            assert body["chunks_ingested"] >= 1
+
+    def test_system_info_flags_are_truthful(self):
+        mod, client = self._client()
+        with client:
+            resp = client.get("/system/info", headers={"X-API-Key": "test-key"})
+            assert resp.status_code == 200
+            feats = resp.json()["features"]
+            assert feats["gnn_propagation"] == mod.PYG_AVAILABLE
+            assert feats["neo4j_driver_installed"] == mod.NEO4J_AVAILABLE
+            assert feats["prometheus_metrics"] == mod.PROMETHEUS_AVAILABLE
+            assert feats["neo4j_connected"] is False  # not connected in test
+
+    def test_request_id_header_present(self):
+        mod, client = self._client()
+        with client:
+            resp = client.get("/health")
+            assert "X-Request-ID" in resp.headers
+
+    def test_missing_body_is_422_not_500(self):
+        mod, client = self._client()
+        with client:
+            # Pydantic body validation -> 422, not a 500 from bad query-param binding.
+            resp = client.post("/admin/mappings", headers={"X-API-Key": "test-key"}, json={})
+            assert resp.status_code == 422
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=line"])
