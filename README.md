@@ -1,118 +1,97 @@
 # Self-Morphing Adaptive Recursion Engine
 
-**A Hybrid, Self-Improving General-Purpose Reasoning Framework with Polymorphic Morphing Nodes, Advanced RAG, PoG/KG-LLM Integration, GNN-like Propagation, and Production-Ready Deployment**
+**A hybrid neurosymbolic reasoning engine with polymorphic morphing nodes, PoG planning, production RAG, a real knowledge-graph layer (SQLite + Neo4j), a learned GNN, autonomous self-teaching, and production deployment (FastAPI + Docker + Kubernetes + Prometheus/Grafana).**
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) <!-- Update if added -->
-[![Status](https://img.shields.io/badge/Status-Prototype%20%7C%20Enhanced-orange.svg)]()
+[![Tests](https://img.shields.io/badge/tests-pytest%20%2B%20hypothesis-green.svg)]()
+[![Status](https://img.shields.io/badge/status-active-brightgreen.svg)]()
 
-> **Evolved from a fuzzy semantic parser into a sophisticated cognitive architecture** capable of deep contextual understanding, adaptive execution morphing, continuous self-teaching, verifiable hybrid intelligence (deterministic + probabilistic), and scalable deployment.
+> Evolved from a fuzzy semantic parser into a verifiable cognitive architecture: deterministic safety and auditability alongside probabilistic flexibility and continuous self-improvement.
+
+---
 
 ## Quick Start
 
-### Local
 ```bash
+# 1. Install (base deps are light; heavy features are optional — see "Dependencies")
 pip install -r deployment/requirements.txt
-python organized_self_morphing_engine.py
-# or
+
+# 2. Try it from the CLI
 python cli.py demo
+python cli.py pog "How can I build a self-improving reasoning agent?" --max-hops 3
+
+# 3. Or run the API (ENGINE_API_KEY is REQUIRED — the server refuses to start without it)
+export ENGINE_API_KEY=your-secret-key
+uvicorn fastapi_server:app --host 0.0.0.0 --port 8000
+# Swagger UI: http://localhost:8000/docs
 ```
 
-### Docker Compose (Recommended)
-```bash
-cd deployment
-./start.sh
-# API + Swagger: http://localhost:8000/docs
-```
+Docker (full stack with Neo4j) and Kubernetes are in [Deployment](#deployment). Observability (Prometheus + Grafana) is a one-line compose overlay.
 
-### Kubernetes
-```bash
-kubectl apply -f deployment/k8s-deployment.yaml
-```
-
-See the **Comprehensive Setup Guide** and **Deployment** sections below for full details.
+---
 
 ## Table of Contents
 - [Overview](#overview)
-- [Key Features & Capabilities](#key-features--capabilities)
+- [Key Features](#key-features)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
-- [Installation & Setup](#installation--setup)
-- [Quick Start & Usage Examples](#quick-start--usage-examples)
+- [Installation & Dependencies](#installation--dependencies)
+- [Usage Examples](#usage-examples)
 - [Configuration](#configuration)
-- [Core Components & API](#core-components--api)
-- [PoG & KG-LLM Integration](#pog--kg-llm-integration)
-- [Testing, Benchmarking & Demo](#testing-benchmarking--demo)
+- [FastAPI Server & CLI](#fastapi-server--cli)
+- [Knowledge Graph & Neo4j](#knowledge-graph--neo4j)
+- [Learned GNN](#learned-gnn)
+- [Observability](#observability)
+- [Testing](#testing)
 - [Deployment](#deployment)
-- [Persistence, Outputs & Monitoring](#persistence-outputs--monitoring)
-- [Limitations, Edge Cases & Known Issues](#limitations-edge-cases--known-issues)
-- [Roadmap & Future Enhancements](#roadmap--future-enhancements)
+- [Persistence & Outputs](#persistence--outputs)
+- [Design Notes & Limitations](#design-notes--limitations)
+- [Roadmap](#roadmap)
 - [Contributing](#contributing)
-- [Acknowledgments](#acknowledgments)
+
+---
 
 ## Overview
 
-The **Self-Morphing Adaptive Recursion Engine** is a production-oriented prototype for general-purpose reasoning. It integrates:
+The engine reasons over a graph of **polymorphic nodes** (`MorphicTextNode`) that morph between `linear`, `tree`, `nested`, and `indirect` execution strategies at runtime, driven by a hybrid similarity signal. Around that core it layers a production RAG pipeline, a knowledge-graph layer, PoG-style adaptive planning, an autonomous self-teaching loop, and a learned GNN — all behind a hardened FastAPI service and a CLI.
 
-- **Polymorphic graph execution** (nodes that dynamically morph between linear, tree, nested, and indirect strategies at runtime).
-- **Hybrid similarity & embeddings** (Levenshtein distance + Torch-based vector embeddings for robust fuzzy + semantic matching).
-- **Advanced RAG pipeline** (semantic/recursive chunking, hybrid retrieval, re-ranking).
-- **Knowledge Graph (KG) layer** (SQLite with advanced schema + optional Neo4j sync for multi-hop reasoning and entity-relation persistence).
-- **PoG (Plan-on-Graph) style adaptive planning** (task decomposition, guidance/memory/reflection loops for self-correcting multi-hop KG exploration).
-- **Autonomous self-teaching** (background LLM-proposal + multi-layer verification loop with dynamic node generation and cycle detection).
-- **GNN-like propagation** (graph message passing for node feature refinement and path optimization).
-- **Safe recursion** (heap-allocated trampoline stack to avoid Python recursion limits).
-- **Production scaffolding** (FastAPI server with Swagger + auth, CLI, distributed multi-process execution, metrics, Docker/K8s support, admin controls, audit logging).
-- **Persistent Vector Database** (FAISS with disk-persisted index + metadata for fast semantic retrieval, integrated with RAG ingestion).
+A guiding principle throughout: **heavy or infrastructure-bound capabilities are optional and degrade gracefully.** FAISS, sentence-transformers, cross-encoder re-rankers, Neo4j, PyTorch-Geometric, Prometheus, and rate limiting are each guarded by an availability flag, so the base install stays light and the test suite runs anywhere. When an optional dependency is absent, the engine falls back to a working (if simpler) implementation rather than failing.
 
-It began as a fuzzy semantic parser for query routing and evolved through iterative enhancements (self-teaching, vector embeddings, RAG, GNN simulation, PoG/KG-LLM, Neo4j integration) into a verifiable, extensible hybrid neurosymbolic engine. The design prioritizes **deterministic safety + auditability** alongside **probabilistic flexibility and self-improvement**, making it suitable for autonomous agents, knowledge systems, troubleshooting pipelines, and research into scalable reasoning architectures.
+`organized_self_morphing_engine.py` is the authoritative implementation (imported by `cli.py`, `fastapi_server.py`, and the tests). `archive/final_self_morphing_engine.py` is an earlier reference snapshot kept only for comparison — it is not part of the runtime.
 
-**Current State**: Core engine, similarity/embedding layers, LLM integration (mock + real SDK stubs), Neo4j stubs, advanced KG schema, PoG-style planning hooks, RAG foundation, and demo infrastructure are implemented. `organized_self_morphing_engine.py` is the authoritative, actively-used implementation (imported by `cli.py`, `fastapi_server.py`, and `test_engine.py`). `archive/final_self_morphing_engine.py` is an earlier, lighter-weight draft kept only for comparing engine evolution — it is not imported anywhere and should not be treated as a live entrypoint.
+## Key Features
 
-## Key Features & Capabilities
+### Polymorphic morphing execution
+- **Node types**: `linear` (tail-recursion flattening), `tree` (branching with multi-criteria tie-breakers), `nested` (encapsulated parameter extraction), `indirect` (mutual-routine / external routing).
+- **Trampoline safety**: a heap-allocated execution stack (`process_query_stream`) prevents Python recursion-depth errors and is provably terminating even on cyclic graphs (see the property tests).
+- **Explosion tracking**: cascading sub-questions are logged for audit.
 
-### Polymorphic Morphing Execution
-- **Node Types**: `linear` (tail recursion flattening), `tree` (branching with sophisticated tie-breakers: similarity + length + ID + history), `nested` (encapsulated parameter extraction & multi-phase feedback), `indirect` (mutual routine jumps / external module routing).
-- **Runtime Adaptation**: Execution path morphs based on input similarity, confidence zones, and admin overrides.
-- **Trampoline Safety**: Heap-based stack prevents recursion depth errors while supporting deep nested/indirect flows.
-- **Explosion Tracking**: Monitors cascading sub-questions (query explosions) for audit and optimization.
+### Hybrid similarity & typo-robust embeddings
+- **Levenshtein** scored on both the raw and synonym-canonicalized forms (so a typo is never penalized against its expanded target token), combined with a **vector** cosine into `hybrid_similarity` (all scores clamped to `[0, 100]`).
+- **Deterministic character-trigram hashed embedding** as the always-available fallback — typo-robust *and* stable across processes (uses a fixed hash, not Python's per-process-randomized `hash()`), so a persisted FAISS index stays valid across runs.
+- **Optional sentence-transformers** for true semantic embeddings; the model is selectable via `ENGINE_EMBEDDING_MODEL`.
 
-### Hybrid Semantic Matching & Embeddings
-- **Levenshtein DP** (cached, vectorized) for fuzzy string matching.
-- **Torch Bag-of-Words Embeddings** (512-dim, normalized) + Cosine similarity.
-- **Hybrid Scoring**: Weighted combination (default 60% Levenshtein + 40% vector) for robust matching beyond pure syntax or semantics.
-- **Synonym Auto-Learning**: Persistent dictionary with DB-backed mappings; low-confidence isolation + admin review queue.
+### Advanced RAG pipeline
+- **Chunking** (`advanced_chunk_text`): `fixed` (sliding window), `semantic` (embedding-based boundary detection between sentences), and `recursive` (hierarchical paragraph → sentence → word → char). All strategies honor overlap and never emit empty chunks.
+- **Production FAISS** (`build_faiss_index`): exact `IndexFlatIP` for small corpora, approximate **HNSW** above a configurable size threshold; disk-persisted and auto-loaded.
+- **Advanced retrieval** (`retrieve_context_advanced`): LLM **query rewriting**, optional **cross-encoder re-ranking**, and **agentic multi-hop** expansion (the LLM proposes follow-up queries until the context is sufficient).
+- **Entity extraction** on ingest seeds the knowledge graph (`kg_entities` + co-occurrence `kg_relations`).
 
-### Advanced RAG Pipeline
-- **Chunking Strategies**: Fixed-size (with overlap), semantic (sentence/paragraph-aware), recursive (hierarchical).
-- **Ingestion & Storage**: Text chunking + embedding + metadata in SQLite `rag_chunks`.
-- **Retrieval**: Top-k hybrid search (vector + keyword/graph signals); multi-hop KG traversal simulation.
-- **Re-ranking & Augmentation**: Planned hooks for context re-ranking and query rewriting.
+### Knowledge graph (SQLite + real Neo4j)
+- Rich SQLite schema: `kg_entities` (with embeddings), `kg_relations` (typed, confidence-scored), `kg_metadata`.
+- **Real Neo4j integration**: `connect_neo4j` opens an actual driver (verified connectivity), a **parameterized Cypher builder** (`build_entity_merge` / `build_relation_merge`, with sanitized relationship types), and **bidirectional sync** (`kg_sync_to_neo4j` / `kg_sync_from_neo4j`). Falls back to the SQLite KG when the driver or server is absent.
 
-### Knowledge Graph (KG) Layer & PoG Integration
-- **Advanced SQLite Schema**: `kg_entities` (with embeddings, source), `kg_relations` (typed, confidence-scored), `kg_metadata`.
-- **Neo4j Sync Stubs**: `connect_neo4j()`, `kg_sync_to_neo4j()` for external persistence and Cypher queries.
-- **PoG-Style Adaptive Planning**: Task decomposition into sub-objectives, adaptive path exploration on KG, memory updating (historical retrieval/reasoning), reflection/self-correction (via auditor + symbolic verifier). Guidance/Memory/Reflection loop for robust multi-hop reasoning and error recovery.
-- **GNN-like Propagation**: Basic message-passing simulation on morphic graph for node refinement and intelligent tie-breaking/path prediction.
+### PoG adaptive planning & self-teaching
+- **PoG** (`pog_plan_and_reason`): task decomposition → multi-hop KG exploration → memory update → reflection/self-correction via the symbolic verifier + self-auditor.
+- **Self-teaching loop**: proposes mappings/nodes via LLM, verifies through multiple layers, learns validated synonyms, and (when a graph is attached) uses GNN signals to prioritize and place new nodes. Tracks proposals, acceptances, rejection rate, average confidence, and learning history.
 
-### Autonomous Self-Teaching & Verification
-- **Background Loop**: Queries unresolved/low-confidence cases from audit logs; proposes mappings/nodes via LLM.
-- **Multi-Layer Verification**: Self-Auditor (similarity + rules), Symbolic Verifier (syntax, consistency, domain rules, embedding cross-check), optional admin halt/override.
-- **Dynamic Graph Evolution**: LLM-proposed nodes validated and attached (with cycle detection); synonym learning persisted.
-- **Metrics Tracking**: Proposals, acceptance rate, avg confidence, rejection rate, learning history.
+### Learned GNN (PyTorch Geometric)
+- Builds a typed PyG graph from the morphic node structure and trains a **GraphSAGE** model for **node classification** and **link prediction** (dynamic path prediction). NumPy mean-aggregation propagation is the fallback when PyG is not installed.
 
-### Production & Distributed Features
-- **FastAPI Server** (`fastapi_server.py`): Modern API with automatic Swagger docs, API key authentication, endpoints for reasoning, PoG planning, RAG ingest/retrieve, self-teaching, admin, metrics, and graph export.
-- **CLI** (`cli.py`): Powerful command-line interface for querying (including PoG), ingesting documents, triggering self-teaching, viewing metrics, and running demos.
-- **Distributed Execution**: `concurrent.futures` Thread/ProcessPool, graph sharding by ID hash, non-blocking task streams.
-- **Observability**: Prometheus-compatible metrics, QA audit logs, explosion logs, learning reports, DOT graph visualization (`morphic_graph.dot`).
-- **Safety Controls**: Admin review queue for low-confidence mappings, halt/resolution interface, symbolic conflict detection.
-- **Persistence**: SQLite (WAL mode for concurrency) + **persistent FAISS vector index** (disk-saved for fast semantic search) + optional Neo4j; learning reports JSON.
-
-### LLM Integration
-- **Real SDK Ready**: Stubs for OpenAI/Groq with JSON mode, retry logic, structured outputs (commented for production).
-- **Mock Fallback**: Deterministic simulation for demos/testing.
-- **JSON-Mode Proposals**: Structured suggestions for mappings, new nodes, confidence scores.
+### Production surface
+- **FastAPI**: lifespan-managed engine, dependency-injected engine accessor, non-blocking (threadpool-offloaded) handlers, optional rate limiting, structured request logging with `X-Request-ID`, API-key auth, Pydantic-validated bodies, and truthful capability flags.
+- **Observability**: a Prometheus `/metrics` exposition endpoint and provisioned Grafana dashboards.
+- **CLI**, Docker/Compose, Kubernetes manifests, and audit/DOT-graph exports.
 
 ## Architecture
 
@@ -120,346 +99,248 @@ It began as a fuzzy semantic parser for query routing and evolved through iterat
 User Query / Task
        │
        ▼
-ProductionAdaptiveEngine (init with target, threshold, embeddings, KG schema, Neo4j stub)
+ProductionAdaptiveEngine(target_solution_text, similarity_threshold)
        │
-       ├── MorphicTextNode Graph (polymorphic: linear/tree/nested/indirect links + branches + sub-questions)
-       │        │
-       │        ├── Trampoline Execution Stack (safe deep recursion)
-       │        │        ├── process_query_stream() → morph based on hybrid_similarity()
-       │        │        ├── Tree tie-breakers + GNN-like propagation for path optimization
-       │        │        └── Explosion tracking & audit
-       │        │
-       │        ├── RAG Layer (advanced_chunk_text, ingest, retrieve_context, kg_enhanced_retrieve)
-       │        │        └── Multi-hop KG signals (SQLite + Neo4j sync)
-       │        │
-       │        └── PoG Adaptive Planning (pog_plan_and_reason)
-       │                 ├── Task Decomposition (sub-objectives via LLM)
-       │                 ├── Guidance / Memory / Reflection Loop (self-correction)
-       │                 └── Path Exploration + Verification (auditor + symbolic)
+       ├── MorphicTextNode graph (linear / tree / nested / indirect)
+       │        └── Trampoline stack (process_query_stream) — safe, terminating
        │
-       ├── Self-Teaching Loop (background)
-       │        ├── LLM proposals (llm_call JSON mode)
-       │        ├── Multi-layer Verify (self_auditor_verify, symbolic_verifier)
-       │        ├── Dynamic Node Attach (cycle detection) + Synonym Learning
-       │        └── Metrics Update + Persistence
+       ├── RAG (advanced_chunk_text → ingest_documents → FAISS → retrieve_context_advanced)
+       │        ├── query rewriting · cross-encoder re-rank · agentic multi-hop
+       │        └── entity extraction → Knowledge Graph
        │
-       └── API / Admin / Metrics (start_api_server, admin_resolve_halt, export_graph_viz)
-              └── Distributed Pools & Observability (logs, reports, DOT viz)
+       ├── Knowledge Graph (SQLite schema ↔ real Neo4j via Cypher builder, bidirectional)
+       │
+       ├── PoG planning (pog_plan_and_reason: decompose → explore → reflect → verify)
+       │
+       ├── Self-teaching loop (LLM propose → multi-layer verify → learn → GNN-guided attach)
+       │
+       ├── Learned GNN (build_graph_tensors → train_gnn → classify / predict links)
+       │
+       └── Service layer (FastAPI + CLI + Prometheus /metrics + admin controls)
 ```
-
-**Data Flow Nuances**:
-- Low-confidence zones trigger auto-learning or admin halt.
-- Tree execution uses multi-criteria tie-breakers (similarity primary, then length/ID/history).
-- KG relations carry confidence; GNN propagation refines node features for better routing.
-- All mutations (learning, node attach) go through verification layers for safety.
-- Neo4j sync is non-breaking stub; falls back to rich SQLite schema.
 
 ## Project Structure
 
 ```
 self-morphing-adaptive-recursion-engine/
-├── organized_self_morphing_engine.py  # Authoritative full implementation (core + all enhancements)
-├── fastapi_server.py                  # Production FastAPI server (Swagger + auth)
-├── cli.py                             # Command-line interface
-├── test_engine.py                     # Comprehensive pytest suite
-├── README.md                          # This file
-├── deployment/
-│   ├── Dockerfile
-│   ├── Dockerfile.full                # Full-featured image (sentence-transformers + faiss-cpu)
-│   ├── docker-compose.yml
-│   ├── docker-compose.full.yml
-│   ├── k8s-deployment.yaml
-│   ├── start.sh                       # One-command startup
-│   ├── build.sh                       # Clean Docker build
-│   └── requirements.txt
+├── organized_self_morphing_engine.py   # Authoritative engine implementation
+├── fastapi_server.py                   # Production FastAPI service
+├── cli.py                              # Command-line interface
+├── test_engine.py                      # Example-based pytest suite
+├── test_properties.py                  # Hypothesis property-based tests
+├── README.md · USAGE.md · GETTING_STARTED.md
 ├── archive/
-│   └── final_self_morphing_engine.py  # Superseded reference version, kept for comparison
-├── engine_logs.db                     # SQLite + persistent FAISS index (generated at runtime)
-├── faiss_index.bin                    # Persistent vector index (auto-managed)
-├── learning_report.json
-├── morphic_graph.dot
-└── run_output.txt / output.log
+│   └── final_self_morphing_engine.py   # Earlier reference snapshot (not runtime)
+└── deployment/
+    ├── requirements.txt
+    ├── Dockerfile · Dockerfile.full     # base image · full image (heavy deps preinstalled)
+    ├── docker-compose.yml               # engine + Neo4j
+    ├── docker-compose.full.yml          # engine (full image)
+    ├── docker-compose.observability.yml # + Prometheus + Grafana overlay
+    ├── k8s-deployment.yaml              # StatefulSet + PVC + Prometheus scrape annotations
+    ├── build.sh · start.sh
+    └── observability/
+        ├── prometheus.yml
+        └── grafana/                     # provisioned datasource + dashboard
 ```
 
-## Installation & Setup
+Runtime artifacts — `engine_logs.db`, `faiss_index.bin`, `gnn_model.pt`, `learning_report.json`, `morphic_graph*.dot` — are generated on use and git-ignored. In containers they live under the persisted `/app/state` volume.
 
-### Prerequisites
-- Python 3.11+
-- Optional: Neo4j server (or use Docker Compose)
-- For production LLM: `OPENAI_API_KEY` or `GROQ_API_KEY` env vars
+## Installation & Dependencies
 
-### Local Setup
+**Prerequisites**: Python 3.11+.
+
 ```bash
-# 1. Clone or copy the artifacts directory
-cd /path/to/artifacts
-
-# 2. (Recommended) Create virtualenv
-python -m venv .venv
-source .venv/bin/activate
-
-# 3. Install dependencies
 pip install -r deployment/requirements.txt
-# Note: neo4j is stubbed (install real driver for full sync: pip install neo4j)
-
-# 4. (Optional) Start Neo4j locally or via Docker
-# docker run --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j:5
-
-# 5. Run demo
-python cli.py demo
 ```
 
-### Docker Setup (Recommended for full stack)
-```bash
-cd deployment
-docker-compose up --build
-# Access API on localhost:8000; Neo4j browser on localhost:7474 (user: neo4j, pass: password)
-```
+**Required**: `torch`, `numpy`, `networkx`, `fastapi`, `uvicorn`, `requests`, `pytest`, `hypothesis`.
 
-Environment variables (`.env` or docker-compose):
-- `ENGINE_API_KEY` (**required** — the API refuses to start without it; no default is provided)
-- `OPENAI_API_KEY`, `GROQ_API_KEY`
-- `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`
+**Optional (graceful fallback if absent)**:
 
-## Quick Start & Usage Examples
+| Dependency | Enables | Fallback when absent |
+|---|---|---|
+| `sentence-transformers` | true semantic embeddings + cross-encoder re-ranking | deterministic char-trigram hashed embedding; base retrieval order |
+| `faiss-cpu` | persistent ANN vector index | brute-force cosine over SQLite |
+| `neo4j` | external graph store + bidirectional sync | rich SQLite KG |
+| `torch-geometric` | learned GraphSAGE GNN | NumPy message-passing propagation |
+| `prometheus-client` | `/metrics` Prometheus exposition | `/metrics` returns 501; `/metrics.json` still works |
+| `slowapi` | API rate limiting | limiter is a no-op |
+| `groq` / `openai` | real LLM calls | deterministic mock LLM |
+
+The `deployment/Dockerfile.full` image preinstalls the heavy optional stack.
+
+## Usage Examples
 
 ```python
 from organized_self_morphing_engine import ProductionAdaptiveEngine
 
-# Initialize (target objective drives routing/similarity baseline)
 engine = ProductionAdaptiveEngine(target_solution_text="Compute Analytics", similarity_threshold=80.0)
 
-# Basic hybrid reasoning query
-result = engine.reasoning_query("How to solve complex data pipeline issues?")  # Uses RAG + morphing + PoG hooks
-print(result)
+# PoG adaptive planning (decomposition + multi-hop + reflection)
+plan = engine.pog_plan_and_reason("Diagnose multi-hop dependencies in a data pipeline", max_hops=3)
+print(plan["result"], plan["confidence"], plan["verified"])
 
-# PoG-style adaptive planning (task decomposition + reflection)
-pog_result = engine.pog_plan_and_reason("Analyze multi-hop dependencies in knowledge graph for troubleshooting")
-print(pog_result)
+# RAG: ingest (returns the real chunk count) and retrieve
+n = engine.ingest_documents(
+    ["Neural networks power deep learning.", "Paris is the capital of France."],
+    strategy="recursive",
+)
+contexts = engine.retrieve_context_advanced(
+    "deep learning", k=3, rewrite=True, rerank=True, agentic=False
+)
 
-# Ingest documents for RAG/KG
-engine.ingest_documents(["path/to/doc1.txt", "path/to/doc2.pdf"])  # Advanced chunking + embedding + KG entity extraction
+# Learned GNN over a morphic graph
+losses = engine.train_gnn(root_node)            # no-op + NumPy fallback if PyG absent
+links = engine.gnn_predict_links(root_node, top_k=5)
 
-# Multi-hop KG-enhanced retrieve
-context = engine.kg_enhanced_retrieve("root cause of query explosion in recursive systems", k=5, hops=2)
-print(context)
-
-# Start API server (for external integration)
-# engine.start_api_server(port=8000)  # Endpoints: /query, /ingest, /metrics, /admin, /graph
-
-# Neo4j sync (after configuring connection)
+# Knowledge graph ↔ Neo4j (no-op with a clear message if not connected)
+engine.connect_neo4j()      # uses NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD
 engine.kg_sync_to_neo4j()
+engine.kg_sync_from_neo4j()
 
-# Run full demo (includes self-teaching iteration, benchmarks, API test)
-engine.run_full_demo()
+# Observability snapshot (the same data the Prometheus endpoint exposes)
+print(engine.get_metrics_snapshot())
 ```
-
-See code for `process_query_stream(task_id, start_node, live_user_input)` for low-level trampoline control and admin flows.
 
 ## Configuration
 
-- **similarity_threshold** (default 80.0): Minimum % for "resolved" match; below triggers learning/halt.
-- **flag_buffer** (5.0): Low-confidence zone width for auto-learning vs admin review.
-- **vocab_size** (512): Embedding dimension.
-- **DB paths**: Hardcoded to `engine_logs.db` (override in `_init_db`).
-- **LLM**: Edit `llm_call` for real client or temperature/max_tokens.
-- **Neo4j**: Params in `connect_neo4j()`; set env vars for compose.
-- **Learning**: `self_teaching_loop(background=True, max_iterations=...)`.
+All configuration is environment-variable driven (nothing hardcoded that matters for deployment):
 
-## Core Components & API
+| Variable | Purpose | Default |
+|---|---|---|
+| `ENGINE_API_KEY` | **required** for the API (fails fast if unset) | — |
+| `ENGINE_DB_PATH` | SQLite database path | `engine_logs.db` |
+| `ENGINE_FAISS_INDEX_PATH` | persisted FAISS index path | `faiss_index.bin` |
+| `ENGINE_FAISS_HNSW_THRESHOLD` | vector count above which HNSW is used | `10000` |
+| `ENGINE_EMBEDDING_MODEL` | sentence-transformers model name | `all-MiniLM-L6-v2` |
+| `ENGINE_RERANK_MODEL` | cross-encoder re-rank model | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| `ENGINE_GNN_MODEL_PATH` | persisted GNN weights path | `gnn_model.pt` |
+| `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | Neo4j connection | `bolt://localhost:7687` / `neo4j` / `password` |
+| `OPENAI_API_KEY` / `GROQ_API_KEY` | real LLM backend | mock LLM |
+| `RATE_LIMIT` | API rate limit (slowapi) | `120/minute` |
+| `LOG_LEVEL` | server log level | `INFO` |
 
-### MorphicTextNode
-Polymorphic container with runtime-morphable links. Tracks triggered sub-questions for explosion analysis.
-
-### ProductionAdaptiveEngine (Main Class)
-**Core Methods Implemented**:
-- `__init__`, `_init_db` (advanced KG schema), `_load_synonyms_from_db`
-- `calculate_similarity` (Levenshtein DP, cached), `_tokenize_synonyms`, `_compute_embedding`, `hybrid_similarity`
-- `llm_call` (mock + real SDK stubs, JSON mode)
-- `connect_neo4j`, `kg_sync_to_neo4j` (stubs with fallback)
-- `run_full_demo`
-
-**Referenced / Consolidated from Prior Iterations** (full logic preserved in `organized_*.py` or extensible):
-- `process_query_stream`, `reasoning_query`, `pog_plan_and_reason`
-- `ingest_documents`, `retrieve_context`, `kg_enhanced_retrieve`, `advanced_chunk_text`
-- `self_teaching_loop`, `self_auditor_verify`, `symbolic_verifier`
-- `attach_node` (with cycle detection), `gnn_propagate`
-- `start_api_server`, `admin_*` methods, `export_graph_viz`, `generate_learning_report`
-- `run_benchmarks`, `run_basic_tests` / full test suite
-
-Admin interfaces, explosion logging, and verification layers provide production safety.
-
-## PoG & KG-LLM Integration
-
-**PoG (Plan-on-Graph)**: Self-correcting adaptive planning over KGs.
-- Decomposes query into sub-objectives (Guidance) via `pog_plan_and_reason`.
-- Iteratively explores reasoning paths on KG while updating Memory (retrieval history + reasoning state).
-- Reflection step evaluates progress, detects errors, triggers self-correction or backtracking.
-- Integrated via the dedicated `pog_plan_and_reason(query, max_hops=3)` method and hooks in reasoning flow + verifier layers.
-
-**KG-LLM Hybrid Patterns**:
-- LLM augments KG construction (entity/relation extraction during ingest).
-- KG grounds LLM outputs (multi-hop retrieval, confidence-scored relations, GNN refinement).
-- Bidirectional: LLM proposes KG updates; KG validates/propagates via GNN-like messages.
-- Benefits: Reduced hallucinations, interpretable multi-hop reasoning, evolving structured memory.
-
-These were added as non-breaking enhancements (stubs + schema + planning hooks) while preserving original morphing core.
-
-## Persistent Vector Database (FAISS)
-
-The engine includes a **persistent FAISS vector index** for fast semantic retrieval:
-- Automatically builds and saves `faiss_index.bin` + metadata on disk.
-- Loaded automatically on engine startup.
-- Integrated with `ingest_documents()` (auto-rebuilds index) and `semantic_retrieve_context()`.
-- Falls back gracefully if FAISS is not installed.
-- Works alongside the advanced RAG chunking (`advanced_chunk_text`) and optional `sentence-transformers` embeddings.
-
-This provides production-grade vector search without requiring an external service while remaining optional.
-
-## Testing, Benchmarking & Demo
-
-- `run_full_demo()`: End-to-end smoke test (RAG, reasoning, self-teaching iteration, API stubs, metrics).
-- `run_benchmarks()`: Similarity timing, teaching loop, etc. (uses `timeit`).
-- `run_basic_tests()`: Unit assertions on hybrid similarity, node morphing, verifiers.
-- Audit logs + `learning_report.json` for post-run analysis.
-- Graph export (`morphic_graph.dot`) for visual inspection (use Graphviz).
-
-Extend with pytest for full coverage of verification layers and PoG loops.
-
-## Deployment
-
-### Docker Compose (Full Stack)
-```bash
-cd deployment
-./start.sh          # Recommended one-liner
-# or
-docker-compose up --build -d
-# FastAPI on :8000 (Swagger: /docs), Neo4j on :7474/:7687
-```
-
-### Kubernetes (Multi-Node Ready)
-```bash
-kubectl apply -f deployment/k8s-deployment.yaml
-# Includes example PersistentVolumeClaim for shared storage.
-# For production multi-replica: use ReadWriteMany storage + external vector DB recommended.
-```
-
-### Production Considerations
-- Use real Neo4j driver + connection pooling.
-- FastAPI is the recommended production API (`fastapi_server.py`).
-- Add Prometheus exporter, structured logging, distributed tracing.
-- Horizontal scaling via Ray/Dask; for true multi-node vector search, prefer external vector DB (pgvector, Qdrant, etc.) over file-based FAISS.
-- Secrets via K8s secrets or Vault; rate limiting on API.
-- CI/CD: Build image, run tests/benchmarks, deploy with rolling updates.
-
-See `Dockerfile`, `docker-compose.yml`, `start.sh`, and `build.sh` in the `deployment/` folder.
+Constructor knobs: `similarity_threshold` (resolved-match cutoff), and internal `flag_buffer` (low-confidence zone width).
 
 ## FastAPI Server & CLI
 
-### FastAPI Server (`fastapi_server.py`)
-Modern, documented API:
+### FastAPI (`fastapi_server.py`)
+
 ```bash
-uvicorn fastapi_server:app --reload --host 0.0.0.0 --port 8000
+export ENGINE_API_KEY=your-secret-key
+uvicorn fastapi_server:app --host 0.0.0.0 --port 8000
 ```
-- Automatic Swagger UI at `/docs`
-- API Key authentication (`X-API-Key` header)
-- Key endpoints: `/query`, `/pog/plan`, `/rag/ingest`, `/rag/retrieve`, `/teach`, `/metrics`, `/admin/*`, `/graph/export`, `/rag/stats`
+
+- Swagger UI at `/docs`; API-key auth via the `X-API-Key` header.
+- Blocking work is offloaded to a threadpool; optional rate limiting; structured logs with `X-Request-ID`.
+- Endpoints: `/query`, `/pog/plan`, `/rag/ingest`, `/rag/retrieve`, `/rag/stats`, `/teach`, `/teach/status`, `/nodes/attach`, `/admin/mappings` (GET/POST), `/admin/resolve`, `/admin/halts`, `/graph/export`, `/graph/visualize`, `/system/info`, `/health`, `/metrics` (Prometheus), `/metrics.json` (authenticated JSON).
+- `/metrics` is unauthenticated by convention (for Prometheus scraping) and exposes only non-sensitive counters; `/system/info` reports *real* runtime capability (installed optional deps and live Neo4j connection).
 
 ### CLI (`cli.py`)
+
 ```bash
-python cli.py --help
+python cli.py demo
 python cli.py pog "How to scale self-improving agents?" --max-hops 3
+python cli.py query "How to handle recursive explosions?"
 python cli.py ingest doc1.txt doc2.txt --strategy semantic
 python cli.py teach --iterations 3
 python cli.py metrics
-python cli.py demo
 ```
 
-## Multi-Node Deployment
+## Knowledge Graph & Neo4j
 
-The engine supports multi-node setups with the following considerations:
+The SQLite KG (`kg_entities`, `kg_relations`, `kg_metadata`) is always available. With the `neo4j` driver installed and a reachable server:
 
-**Docker Compose Scaling** (limited):
-```yaml
-# In docker-compose.yml
-deploy:
-  replicas: 3
+- `connect_neo4j()` opens a verified connection (from `NEO4J_URI/USER/PASSWORD`);
+- `kg_sync_to_neo4j()` pushes entities/relations via idempotent, parameterized `MERGE` Cypher (relationship types are sanitized to safe identifiers — Cypher cannot parameterize them);
+- `kg_sync_from_neo4j()` pulls the graph back into SQLite, keeping both stores consistent.
+
+The bundled `docker-compose.yml` includes a Neo4j service and a healthcheck so the engine only starts once Neo4j is ready.
+
+## Learned GNN
+
+`build_graph_tensors(root)` converts a `MorphicTextNode` graph (cycle-safely) into node features (embedding ⊕ one-hot node type) and typed edges (`linear` / `branch` / `inner_formula` / `mutual_routine`). `train_gnn(root)` trains a GraphSAGE encoder with node-classification and link-prediction heads (weights persisted to `ENGINE_GNN_MODEL_PATH`); `gnn_classify_nodes`, `gnn_predict_links`, and `gnn_node_relevance` provide inference. Without `torch-geometric`, a NumPy propagation fallback keeps all of this functional.
+
+## Observability
+
+- The engine exposes `get_metrics_snapshot()`; the FastAPI `/metrics` endpoint renders it in Prometheus text-exposition format (`morphic_*` gauges: proposals, accepted learnings, rejection rate, average confidence, explosion events, KB size, FAISS vectors, admin-queue size, …).
+- Stand up the full monitoring stack with the overlay:
+
+```bash
+cd deployment
+ENGINE_API_KEY=your-secret-key docker-compose -f docker-compose.yml -f docker-compose.observability.yml up --build
+# Grafana: http://localhost:3000 (admin/admin)  ·  Prometheus: http://localhost:9090
 ```
-Note: SQLite + file-based FAISS require shared storage (NFS volume) for consistency.
 
-**Kubernetes (Recommended for Multi-Node)**:
-- Replicas set to 3 in `k8s-deployment.yaml`
-- Includes example `PersistentVolumeClaim` (ReadWriteMany)
-- For production: Mount shared PVC for `/app` (DB + FAISS index) **or** migrate to an external vector database + shared Postgres/Neo4j.
+Grafana is auto-provisioned with the Prometheus datasource and a dashboard (learning metrics + explosion rates). The Kubernetes manifest carries `prometheus.io/scrape` annotations.
 
-**Best Practice for Scale**:
-- Use the persistent FAISS index for single-node or small clusters.
-- For large multi-node deployments, replace FAISS with a distributed vector DB (e.g., Milvus, Qdrant, or pgvector) while keeping the rest of the engine unchanged.
-- Self-teaching and admin features remain functional across nodes when using shared persistent storage.
+## Testing
 
-## Persistence, Outputs & Monitoring
+```bash
+pytest -q                      # full suite
+pytest test_properties.py -q   # property-based tests only
+```
 
-- **engine_logs.db**: Full audit (synonym_mappings, qa_audit_log, query_explosions, rag_chunks, kg_entities/relations/metadata). WAL mode for concurrency.
-- **learning_report.json**: Snapshot of proposals, acceptance, confidence metrics.
-- **morphic_graph.dot**: DOT representation of current morphic structure (nodes = id/key_phrase/type; edges = links/branches).
-- Logs: Console + `output.log` / `run_output.txt`.
-- Metrics: In-memory `learning_metrics`; extend to Prometheus `/metrics` endpoint.
+- `test_engine.py` — example-based tests across similarity, chunking, retrieval, entity extraction, Neo4j (mocked driver), GNN (fallback + PyG-gated), metrics, and the FastAPI surface.
+- `test_properties.py` — **Hypothesis** property-based tests for morphing invariants: similarity bounds/symmetry/reflexivity, deterministic embeddings, chunking coverage (no dropped content, no empty chunks), cycle-safe & terminating graph traversal, cache invalidation after synonym mutation, and trampoline termination on deep/cyclic graphs.
 
-Query DB directly for analytics or build dashboards on explosion counts, learning trends, KG growth.
+Tests requiring an optional dependency `skipif` when it's absent, so the suite is green on a base install. (The property tests originally caught a real invariant bug — a similarity score exceeding 100 from floating-point rounding — now fixed by clamping.)
 
-## Limitations, Edge Cases & Known Issues
+## Deployment
 
-- **LLM Dependency**: Generative parts (proposals, PoG decomposition) rely on external LLM or mock. Hallucinations possible without strong verification (mitigated by multi-layer checks).
-- **Scale**: Single-process demo; distributed sharding/orchestration is stubbed. Large graphs or high query volume may need Ray + persistent KV store.
-- **Embeddings**: Simple hash-based BoW (fast, no external models). Upgrade path to sentence-transformers or fine-tuned models exists in design.
-- **Neo4j**: Full driver integration is stub; requires `pip install neo4j` + running server. Sync is one-way placeholder.
-- **Final.py State**: Many advanced methods (complete RAG chunkers, full GNN training loop, exhaustive PoG reflection) are referenced from prior iterations or stubbed with comments. Use `organized_self_morphing_engine.py` as reference implementation or extend `final_`.
-- **Edge Cases**:
-  - Very short/empty queries → low similarity, triggers learning/halt.
-  - High explosion depth → logged but may overwhelm stack if not pruned.
-  - Conflicting synonym proposals → symbolic verifier flags; admin resolution required.
-  - Cycle in dynamic node attachment → detected and rejected.
-  - No Neo4j → graceful fallback to SQLite (rich schema still provides value).
-- **No Persistence of Full Graph State** beyond DB tables and DOT export (in-memory nodes on restart).
-- **Security**: Basic; add auth, input sanitization, sandboxing for LLM-generated code/nodes in prod.
+### Docker Compose (engine + Neo4j)
+```bash
+cd deployment
+export ENGINE_API_KEY=your-secret-key
+./start.sh
+# API + Swagger: http://localhost:8000/docs · Neo4j: http://localhost:7474
+```
+Add `-f docker-compose.observability.yml` (see [Observability](#observability)) for Prometheus + Grafana. Use `docker-compose.full.yml` / `Dockerfile.full` for an image with the heavy optional stack preinstalled. Images run as a non-root user.
 
-## Roadmap & Future Enhancements
+### Kubernetes
+```bash
+kubectl apply -f deployment/k8s-deployment.yaml
+```
+A `StatefulSet` with a `PersistentVolumeClaim` mounted at `/app/state` (where the DB and FAISS index live), readiness/liveness probes, resource limits, and Prometheus scrape annotations. `ENGINE_API_KEY` (and optional LLM keys) are read from a `morphic-secrets` Secret. For large multi-replica deployments, prefer an external vector DB (Qdrant/Milvus/pgvector) over the file-based FAISS index.
 
-**Near-term**:
-- Flesh out remaining stubbed methods in `organized_self_morphing_engine.py` (full `advanced_chunk_text`, complete `self_teaching_loop` with GNN signals, production FastAPI migration).
-- Real Neo4j driver + bidirectional sync + Cypher query builder.
-- Pre-trained embeddings + FAISS index for production RAG scale.
-- Full test suite (pytest) + property-based testing for morphing invariants.
-- Prometheus exporter + Grafana dashboards for learning metrics / explosion rates.
+## Persistence & Outputs
 
-**Mid-term**:
-- Learned GNN (PyTorch Geometric) for dynamic path prediction and node classification.
-- Multi-agent orchestration hub (integrate with external agents like Manus/Goose/Claude/GPT etc.).
-- Advanced RAG: query rewriting, re-ranking models, agentic retrieval.
-- iOS / on-device companion (agentic shortcuts calling the engine API).
+- **`engine_logs.db`** (SQLite, WAL): `synonym_mappings`, `qa_audit_log`, `query_explosions`, `rag_chunks`, `kg_entities`/`kg_relations`/`kg_metadata`.
+- **`faiss_index.bin`** (+ `.contents.json`): persisted vector index, auto-loaded on startup.
+- **`gnn_model.pt`**: persisted GNN weights.
+- **`learning_report.json`**: proposals / acceptance / confidence snapshot (`generate_learning_report`).
+- **`morphic_graph*.dot`**: Graphviz DOT export of the morphic structure (`export_graph_viz`).
 
-**Long-term / Research**:
-- Continuous online learning without catastrophic forgetting.
-- Formal verification of morphing safety properties.
-- Production multi-tenant deployment with tenant-isolated graphs and billing.
+## Design Notes & Limitations
 
-Contributions in these areas (especially fleshing out stubs while preserving non-breaking nature) are highly valued.
+- **LLM dependence**: generative steps (proposals, PoG decomposition, query rewriting, agentic hops) use a real LLM when `OPENAI_API_KEY`/`GROQ_API_KEY` are set, otherwise a deterministic mock — sufficient for demos and tests but not for production reasoning quality.
+- **In-memory graph**: `MorphicTextNode` graphs are in-memory per request; durable state lives in the DB/KG, not as a serialized graph.
+- **Single-node vector search**: the file-based FAISS index suits single-node or small clusters; scale out with an external vector DB.
+- **Security**: API-key auth + optional rate limiting are provided; add input sanitization and sandboxing before exposing LLM-generated content externally.
+
+## Roadmap
+
+The original productionization roadmap is **complete** and merged:
+
+- ✅ Fleshed-out engine methods (real semantic/recursive chunking, GNN-guided self-teaching, production FastAPI migration)
+- ✅ Real Neo4j driver + bidirectional sync + Cypher builder
+- ✅ Pre-trained embeddings + production FAISS (HNSW) scaling
+- ✅ Prometheus exporter + Grafana dashboards
+- ✅ Advanced RAG: query rewriting, cross-encoder re-ranking, agentic retrieval
+- ✅ Learned GNN (PyTorch Geometric) for path prediction / node classification
+- ✅ Full pytest suite + Hypothesis property-based testing
+
+Possible future directions: continuous online learning without catastrophic forgetting, formal verification of morphing-safety properties, multi-agent orchestration, and multi-tenant deployment with isolated graphs.
 
 ## Contributing
 
-1. Fork & branch from `main`.
-2. Make focused changes (prefer non-breaking additions with feature flags or optional params).
-3. Add/update tests and run `python -m pytest` (or extend `run_basic_tests`).
-4. Update README and docstrings.
-5. Submit PR with clear description of morphing/RAG/KG impact.
-
-Issues/PRs welcome for bugs in verification layers, PoG reflection logic, embedding quality, or deployment.
-
-## Acknowledgments
-
-Built iteratively with hybrid neurosymbolic principles, drawing inspiration from Graph-of-Thoughts / Plan-on-Graph research, adaptive recursion patterns, and production agent frameworks. Special thanks to the iterative enhancement process that added PoG/KG-LLM, Neo4j stubs, advanced schema, and deployment scaffolding while keeping the polymorphic core intact.
-
-**Explore the code** — start with `organized_self_morphing_engine.py` (the authoritative implementation); `archive/final_self_morphing_engine.py` is kept only as an earlier reference snapshot for comparison.
+1. Branch from `main`.
+2. Prefer non-breaking, optional-with-fallback additions (match the existing `*_AVAILABLE` guard pattern).
+3. Add/update tests (`pytest`), including a property test for any new invariant.
+4. Keep docstring coverage high and update this README when behavior changes.
+5. Open a PR describing the morphing / RAG / KG / GNN impact.
 
 ---
 
-*Last refined: 2026-07-05. This README aims for completeness while highlighting actionable next steps for productionization and research extensions.*
+*Explore the code starting from `organized_self_morphing_engine.py` (the authoritative implementation). `archive/final_self_morphing_engine.py` is an earlier snapshot kept only for comparison.*
