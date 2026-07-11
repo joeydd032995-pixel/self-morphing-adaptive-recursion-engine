@@ -1,0 +1,23 @@
+# Dockerfile.full for Self-Morphing Adaptive Recursion Engine
+# Full-featured image: includes sentence-transformers + faiss-cpu (already part of
+# deployment/requirements.txt) plus any extra system packages those libraries need.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies (torch, faiss, sentence-transformers all need a compiler toolchain)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies
+COPY deployment/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY organized_self_morphing_engine.py fastapi_server.py cli.py .
+
+# API port (default 8000 in code)
+EXPOSE 8000
+
+CMD ["uvicorn", "fastapi_server:app", "--host", "0.0.0.0", "--port", "8000"]

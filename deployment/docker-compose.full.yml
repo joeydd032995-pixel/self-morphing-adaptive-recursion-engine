@@ -1,0 +1,18 @@
+services:
+  engine:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.full
+    container_name: morphic-engine-full
+    ports:
+      - "8000:8000"
+    environment:
+      - ENGINE_API_KEY=${ENGINE_API_KEY:?ENGINE_API_KEY must be set}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+    volumes:
+      - engine_persistence:/app/state
+    restart: unless-stopped
+
+volumes:
+  engine_persistence:

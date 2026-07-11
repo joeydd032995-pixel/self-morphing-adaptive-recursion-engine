@@ -66,6 +66,9 @@ print(engine.learning_metrics)
 ```bash
 cd deployment
 
+# ENGINE_API_KEY is required - the API will not start without it
+export ENGINE_API_KEY=your-secret-key
+
 # One command to start everything
 ./start.sh
 ```
@@ -76,7 +79,7 @@ Then open:
 
 ```bash
 curl -X POST http://localhost:8000/pog/plan \
-  -H "X-API-Key: demo-secret-key-123" \
+  -H "X-API-Key: your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{"query": "Explain self-teaching AI systems", "max_hops": 3}'
 ```

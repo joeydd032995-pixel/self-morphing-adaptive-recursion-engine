@@ -67,7 +67,7 @@ The **Self-Morphing Adaptive Recursion Engine** is a production-oriented prototy
 
 It began as a fuzzy semantic parser for query routing and evolved through iterative enhancements (self-teaching, vector embeddings, RAG, GNN simulation, PoG/KG-LLM, Neo4j integration) into a verifiable, extensible hybrid neurosymbolic engine. The design prioritizes **deterministic safety + auditability** alongside **probabilistic flexibility and self-improvement**, making it suitable for autonomous agents, knowledge systems, troubleshooting pipelines, and research into scalable reasoning architectures.
 
-**Current State**: Core engine, similarity/embedding layers, LLM integration (mock + real SDK stubs), Neo4j stubs, advanced KG schema, PoG-style planning hooks, RAG foundation, and demo infrastructure are implemented. Many advanced methods (full self-teaching verification, GNN propagation, complete RAG chunking) are consolidated from prior iterations or stubbed for extensibility in `final_self_morphing_engine.py`. The longer `organized_self_morphing_engine.py` preserves the original comprehensive implementation.
+**Current State**: Core engine, similarity/embedding layers, LLM integration (mock + real SDK stubs), Neo4j stubs, advanced KG schema, PoG-style planning hooks, RAG foundation, and demo infrastructure are implemented. `organized_self_morphing_engine.py` is the authoritative, actively-used implementation (imported by `cli.py`, `fastapi_server.py`, and `test_engine.py`). `archive/final_self_morphing_engine.py` is an earlier, lighter-weight draft kept only for comparing engine evolution — it is not imported anywhere and should not be treated as a live entrypoint.
 
 ## Key Features & Capabilities
 
@@ -157,21 +157,24 @@ ProductionAdaptiveEngine (init with target, threshold, embeddings, KG schema, Ne
 ## Project Structure
 
 ```
-/home/workdir/artifacts/
+self-morphing-adaptive-recursion-engine/
 ├── organized_self_morphing_engine.py  # Authoritative full implementation (core + all enhancements)
 ├── fastapi_server.py                  # Production FastAPI server (Swagger + auth)
 ├── cli.py                             # Command-line interface
 ├── test_engine.py                     # Comprehensive pytest suite
-├── final_self_morphing_engine.py      # Lightweight reference / compatibility version
 ├── README.md                          # This file
 ├── deployment/
 │   ├── Dockerfile
+│   ├── Dockerfile.full                # Full-featured image (sentence-transformers + faiss-cpu)
 │   ├── docker-compose.yml
+│   ├── docker-compose.full.yml
 │   ├── k8s-deployment.yaml
 │   ├── start.sh                       # One-command startup
 │   ├── build.sh                       # Clean Docker build
 │   └── requirements.txt
-├── engine_logs.db                     # SQLite + persistent FAISS index
+├── archive/
+│   └── final_self_morphing_engine.py  # Superseded reference version, kept for comparison
+├── engine_logs.db                     # SQLite + persistent FAISS index (generated at runtime)
 ├── faiss_index.bin                    # Persistent vector index (auto-managed)
 ├── learning_report.json
 ├── morphic_graph.dot
@@ -196,13 +199,13 @@ source .venv/bin/activate
 
 # 3. Install dependencies
 pip install -r deployment/requirements.txt
-# Note: sqlite3 is stdlib; neo4j is stubbed (install real driver for full sync: pip install neo4j)
+# Note: neo4j is stubbed (install real driver for full sync: pip install neo4j)
 
 # 4. (Optional) Start Neo4j locally or via Docker
 # docker run --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j:5
 
 # 5. Run demo
-python final_self_morphing_engine.py
+python cli.py demo
 ```
 
 ### Docker Setup (Recommended for full stack)
@@ -213,13 +216,14 @@ docker-compose up --build
 ```
 
 Environment variables (`.env` or docker-compose):
+- `ENGINE_API_KEY` (**required** — the API refuses to start without it; no default is provided)
 - `OPENAI_API_KEY`, `GROQ_API_KEY`
 - `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`
 
 ## Quick Start & Usage Examples
 
 ```python
-from final_self_morphing_engine import ProductionAdaptiveEngine
+from organized_self_morphing_engine import ProductionAdaptiveEngine
 
 # Initialize (target objective drives routing/similarity baseline)
 engine = ProductionAdaptiveEngine(target_solution_text="Compute Analytics", similarity_threshold=80.0)
@@ -421,7 +425,7 @@ Query DB directly for analytics or build dashboards on explosion counts, learnin
 ## Roadmap & Future Enhancements
 
 **Near-term**:
-- Flesh out stubbed methods in `final_self_morphing_engine.py` (full `advanced_chunk_text`, complete `self_teaching_loop` with GNN signals, production FastAPI migration).
+- Flesh out remaining stubbed methods in `organized_self_morphing_engine.py` (full `advanced_chunk_text`, complete `self_teaching_loop` with GNN signals, production FastAPI migration).
 - Real Neo4j driver + bidirectional sync + Cypher query builder.
 - Pre-trained embeddings + FAISS index for production RAG scale.
 - Full test suite (pytest) + property-based testing for morphing invariants.
@@ -455,7 +459,7 @@ Issues/PRs welcome for bugs in verification layers, PoG reflection logic, embedd
 
 Built iteratively with hybrid neurosymbolic principles, drawing inspiration from Graph-of-Thoughts / Plan-on-Graph research, adaptive recursion patterns, and production agent frameworks. Special thanks to the iterative enhancement process that added PoG/KG-LLM, Neo4j stubs, advanced schema, and deployment scaffolding while keeping the polymorphic core intact.
 
-**Explore the code** — start with `final_self_morphing_engine.py` and cross-reference `organized_self_morphing_engine.py` for full historical implementations of methods.
+**Explore the code** — start with `organized_self_morphing_engine.py` (the authoritative implementation); `archive/final_self_morphing_engine.py` is kept only as an earlier reference snapshot for comparison.
 
 ---
 

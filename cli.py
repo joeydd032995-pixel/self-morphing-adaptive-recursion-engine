@@ -16,7 +16,11 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from organized_self_morphing_engine import ProductionAdaptiveEngine
+from organized_self_morphing_engine import (
+    ProductionAdaptiveEngine,
+    FAISS_AVAILABLE,
+    SENTENCE_TRANSFORMERS_AVAILABLE,
+)
 
 def main():
     parser = argparse.ArgumentParser(description="Self-Morphing Adaptive Recursion Engine CLI")

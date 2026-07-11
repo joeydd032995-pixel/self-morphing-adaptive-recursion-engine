@@ -65,7 +65,7 @@ spec:
               optional: true
         volumeMounts:
         - name: engine-data
-          mountPath: /app
+          mountPath: /app/state
         resources:
           requests:
             memory: "1Gi"

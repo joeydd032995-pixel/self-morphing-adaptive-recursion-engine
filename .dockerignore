@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.db
+*.bin
+.env
+.venv/
+venv/
+.git/
+.pytest_cache/
+data/
+archive/
+learning_report.json
+morphic_graph.dot

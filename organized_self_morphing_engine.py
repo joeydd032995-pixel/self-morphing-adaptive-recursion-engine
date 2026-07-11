@@ -69,8 +69,9 @@ class ProductionAdaptiveEngine:
         self.threshold = similarity_threshold
         self.flag_buffer = 5.0  # Low confidence zone range (e.g., 80% to 85%)
         
-        # Thread safety for shared structures
-        self._lock = threading.Lock()
+        # Thread safety for shared structures (reentrant: attach_node holds this
+        # while calling symbolic_verifier, which acquires it again internally)
+        self._lock = threading.RLock()
         
         # Core Concept Tokens Table (Seed Vocabulary Matrix)
         self.synonym_dictionary = {
@@ -115,6 +116,10 @@ class ProductionAdaptiveEngine:
         self.faiss_index_path = "faiss_index.bin"
         self.faiss_contents = []
         self.load_faiss_index()  # Attempt to load existing persistent index on startup
+
+        # Per-instance memoized similarity (bound here, not on the class, so the
+        # cache dies with the instance instead of pinning every instance forever)
+        self.calculate_similarity = lru_cache(maxsize=512)(self._calculate_similarity_uncached)
 
     def _init_db(self):
         """Initialize SQLite database for persistent logging and mappings."""
@@ -304,10 +309,9 @@ class ProductionAdaptiveEngine:
         words = re.findall(r'\b\w+\b', text)
         return " ".join([self.synonym_dictionary.get(w, w) for w in words])
 
-    @lru_cache(maxsize=512)
-    def calculate_similarity(self, s1, s2):
+    def _calculate_similarity_uncached(self, s1, s2):
         """Vectorized Dynamic Programming Levenshtein Distance Matrix Calculation.
-        Cached for performance on repeated similar queries."""
+        Cached per-instance in __init__ (see self.calculate_similarity)."""
         t1 = self._tokenize_synonyms(s1)
         t2 = self._tokenize_synonyms(s2)
 
@@ -1040,11 +1044,15 @@ class ProductionAdaptiveEngine:
         try:
             import networkx as nx
             G = nx.DiGraph()
+            visited = set()
             def add_nodes(node, parent_id=None):
                 if not node: return
                 G.add_node(node.id, label=node.key_phrase, type=node.node_type)
                 if parent_id:
                     G.add_edge(parent_id, node.id)
+                if node.id in visited:
+                    return
+                visited.add(node.id)
                 if node.next_linear:
                     add_nodes(node.next_linear, node.id)
                 for branch in node.branches.values():
@@ -1146,10 +1154,11 @@ class ProductionAdaptiveEngine:
         reflection = self.llm_call(reflection_prompt, json_mode=True)
         
         verified = False
+        final_conf = current_conf
         if isinstance(reflection, dict):
             final_conf = reflection.get("final_confidence", current_conf)
             verified = self.symbolic_verifier(str(reflection), query) and self.self_auditor_verify(str(reflection), query)
-        
+
         if verified and final_conf > 70:
             result = f"✅ PoG Plan Complete: {sub_objectives[0]} → {memory['hops'][-1]['path'] if memory['hops'] else 'direct'} (conf {final_conf:.1f}%)"
         else:
