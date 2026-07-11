@@ -38,6 +38,11 @@ spec:
     metadata:
       labels:
         app: morphic-engine
+      annotations:
+        # Prometheus scrape discovery: the engine serves metrics on the API port.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
       - name: engine

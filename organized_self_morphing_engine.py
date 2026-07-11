@@ -1525,8 +1525,19 @@ class ProductionAdaptiveEngine:
                         # Update metrics
                         self.learning_metrics["accepted_learnings"] += 1
                         self.learning_metrics["avg_confidence"] = (self.learning_metrics["avg_confidence"] * (self.learning_metrics["accepted_learnings"]-1) + conf) / self.learning_metrics["accepted_learnings"]
+                        self.learning_metrics["learning_history"].append({
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "word": word, "token": token, "confidence": conf, "outcome": "accepted",
+                        })
+                        self._update_rejection_rate()
                     print(f"🎓 [Self-Teaching] Learned via JSON + Verify: {word} -> {token} (conf: {conf:.1f}%)")
                 else:
+                    with self._lock:
+                        self.learning_metrics["learning_history"].append({
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "outcome": "rejected",
+                        })
+                        self._update_rejection_rate()
                     print("🚫 [Zero-Human] Verification layers rejected proposal for safety.")
                 time.sleep(0.5)  # Throttle
 
@@ -1838,6 +1849,48 @@ class ProductionAdaptiveEngine:
         if attached:
             print(f"🔗 [GNN] Attached {new_node.id} under best-fit node {best_id}.")
         return attached
+
+    def _update_rejection_rate(self):
+        """Recompute rejection_rate from the learning history (caller holds the lock)."""
+        history = self.learning_metrics["learning_history"]
+        total = len(history)
+        if total:
+            rejected = sum(1 for h in history if h.get("outcome") == "rejected")
+            self.learning_metrics["rejection_rate"] = rejected / total
+
+    def get_metrics_snapshot(self):
+        """Flat dict of numeric operational metrics for observability exporters
+        (Prometheus). Reads live learning metrics plus counts from the SQLite KG/RAG
+        tables. Safe to call frequently; used by the /metrics scrape endpoint."""
+        lm = self.learning_metrics
+        snapshot = {
+            "total_proposals": lm.get("total_proposals", 0),
+            "accepted_learnings": lm.get("accepted_learnings", 0),
+            "rejection_rate": lm.get("rejection_rate", 0.0),
+            "avg_confidence": lm.get("avg_confidence", 0.0),
+            "learning_history_len": len(lm.get("learning_history", [])),
+            "synonym_count": len(self.synonym_dictionary),
+            "explosion_events": len(self.explosion_log),
+            "admin_queue_size": len(self.admin_review_queue),
+            "has_neo4j": 1 if getattr(self, "has_neo4j", False) else 0,
+            "faiss_vectors": len(getattr(self, "faiss_contents", []) or []),
+        }
+        # Counts from persistent stores (best-effort; never raise on a scrape).
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            for key, table in (("rag_chunks", "rag_chunks"),
+                               ("kg_entities", "kg_entities"),
+                               ("kg_relations", "kg_relations"),
+                               ("qa_audit_events", "qa_audit_log")):
+                try:
+                    snapshot[key] = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                except Exception:
+                    snapshot[key] = 0
+            conn.close()
+        except Exception:
+            pass
+        return snapshot
 
     def generate_learning_report(self):
         """Export rich report on system state and learning efficacy."""

@@ -1,0 +1,13 @@
+# Auto-load dashboards from the mounted dashboards directory.
+apiVersion: 1
+
+providers:
+  - name: morphic-dashboards
+    orgId: 1
+    folder: "Morphic Engine"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

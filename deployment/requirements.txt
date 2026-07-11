@@ -11,3 +11,4 @@ groq  # optional
 openai  # optional
 neo4j  # for external KG
 torch-geometric  # optional, for the learned GNN (falls back to NumPy propagation if absent)
+prometheus-client  # optional, for the /metrics Prometheus exposition endpoint
