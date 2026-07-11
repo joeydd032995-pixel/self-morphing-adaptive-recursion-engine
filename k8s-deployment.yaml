@@ -1,0 +1,127 @@
+# =============================================================================
+# Self-Morphing Adaptive Recursion Engine - Production Kubernetes Manifests
+# =============================================================================
+# Features:
+# - StatefulSet for stable network identity and ordered deployment
+# - PersistentVolumeClaim for DB + FAISS index persistence
+# - Readiness & Liveness probes
+# - Resource limits and requests
+# - Multi-replica ready (with shared storage or external vector DB)
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: morphic-engine-pvc
+spec:
+  accessModes:
+    - ReadWriteMany          # Use NFS, CephFS, or similar for multi-replica
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: standard  # Change to your RWX storage class
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: morphic-engine
+  labels:
+    app: morphic-engine
+spec:
+  serviceName: morphic-engine
+  replicas: 3
+  selector:
+    matchLabels:
+      app: morphic-engine
+  template:
+    metadata:
+      labels:
+        app: morphic-engine
+    spec:
+      containers:
+      - name: engine
+        image: morphic-engine:latest
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: ENGINE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: morphic-secrets
+              key: api-key
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: morphic-secrets
+              key: openai-api-key
+              optional: true
+        - name: GROQ_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: morphic-secrets
+              key: groq-api-key
+              optional: true
+        volumeMounts:
+        - name: engine-data
+          mountPath: /app
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 20
+      volumes:
+      - name: engine-data
+        persistentVolumeClaim:
+          claimName: morphic-engine-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: morphic-engine
+spec:
+  selector:
+    app: morphic-engine
+  ports:
+  - port: 80
+    targetPort: 8000
+    name: http
+  type: ClusterIP
+
+---
+# Optional: Headless service for StatefulSet stable DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: morphic-engine-headless
+spec:
+  selector:
+    app: morphic-engine
+  clusterIP: None
+  ports:
+  - port: 8000
+
+# =============================================================================
+# Notes for Multi-Node / Production:
+# - Use ReadWriteMany storage class for the PVC when running >1 replica.
+# - For large scale, replace file-based FAISS with an external vector database
+#   (Qdrant, Milvus, pgvector) and mount only logs/config via PVC.
+# - Add Ingress or Gateway API for external access + TLS.
+# - Consider HorizontalPodAutoscaler based on CPU/memory or custom metrics.
+# =============================================================================

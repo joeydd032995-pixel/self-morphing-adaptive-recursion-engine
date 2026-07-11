@@ -1,0 +1,11 @@
+torch
+numpy
+networkx
+sqlite3
+fastapi
+uvicorn
+requests
+faiss-cpu  # optional, for vector DB
+groq  # optional
+openai  # optional
+neo4j  # for external KG
