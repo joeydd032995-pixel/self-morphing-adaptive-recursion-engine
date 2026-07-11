@@ -4,6 +4,7 @@ import datetime
 import concurrent.futures
 import sqlite3
 import json
+import hashlib
 import functools
 import threading
 import random  # For mock LLM simulation
@@ -27,6 +28,14 @@ try:
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
     _semantic_model = None
+
+try:
+    from sentence_transformers import CrossEncoder
+    CROSS_ENCODER_AVAILABLE = True
+    _cross_encoder_model = None  # Lazy loaded
+except ImportError:
+    CROSS_ENCODER_AVAILABLE = False
+    _cross_encoder_model = None
 
 # =====================================================================
 # 1. THE DATA STRUCTURE LAYOUT (Heterogeneous Morphic Graph Nodes)
@@ -315,36 +324,61 @@ class ProductionAdaptiveEngine:
         words = re.findall(r'\b\w+\b', text)
         return " ".join([self.synonym_dictionary.get(w, w) for w in words])
 
-    def _calculate_similarity_uncached(self, s1, s2):
-        """Vectorized Dynamic Programming Levenshtein Distance Matrix Calculation.
-        Cached per-instance in __init__ (see self.calculate_similarity)."""
-        t1 = self._tokenize_synonyms(s1)
-        t2 = self._tokenize_synonyms(s2)
+    @staticmethod
+    def _levenshtein_pct(a, b):
+        """Character-level Levenshtein distance expressed as a 0-100 similarity percentage."""
+        if len(a) < len(b):
+            a, b = b, a
+        if len(b) == 0:
+            return 100.0 if len(a) == 0 else 0.0
 
-        if len(t1) < len(t2):
-            t1, t2 = t2, t1
-        if len(t2) == 0:
-            return 100.0 if len(t1) == 0 else 0.0
-
-        previous_row = list(range(len(t2) + 1))
-        for i, c1 in enumerate(t1):
+        previous_row = list(range(len(b) + 1))
+        for i, c1 in enumerate(a):
             current_row = [i + 1]
-            for j, c2 in enumerate(t2):
+            for j, c2 in enumerate(b):
                 insertions = previous_row[j + 1] + 1
                 deletions = current_row[j] + 1
                 substitutions = previous_row[j] + (1 if c1 != c2 else 0)
                 current_row.append(min(insertions, deletions, substitutions))
             previous_row = current_row
 
-        return (1.0 - (previous_row[-1] / max(len(t1), len(t2)))) * 100.0
+        return (1.0 - (previous_row[-1] / max(len(a), len(b)))) * 100.0
+
+    def _calculate_similarity_uncached(self, s1, s2):
+        """Levenshtein similarity scored on BOTH the raw and synonym-canonicalized
+        forms, taking the higher score. Canonicalization lets synonyms match, but a
+        misspelled word ('comput') does not expand to a token and would otherwise be
+        penalized against the expanded target ('compute_token'); scoring the raw form
+        too ensures typos are not scored worse than exact spellings.
+        Cached per-instance in __init__ (see self.calculate_similarity)."""
+        raw_score = self._levenshtein_pct(s1, s2)
+        canon_score = self._levenshtein_pct(
+            self._tokenize_synonyms(s1), self._tokenize_synonyms(s2)
+        )
+        return max(raw_score, canon_score)
+
+    @staticmethod
+    def _stable_hash(token):
+        """Deterministic hash (unlike builtin hash(), which is per-process randomized).
+        Stable buckets are required so persisted FAISS vectors remain valid across runs."""
+        return int.from_bytes(hashlib.md5(token.encode("utf-8")).digest()[:8], "big")
 
     def _compute_embedding(self, text):
-        """Rich vector embedding using hash-based bag-of-words (numpy + torch compatible).
-        Provides semantic-like similarity beyond Levenshtein for hybridization."""
-        words = re.findall(r'\b\w+\b', text.lower())
+        """Hashed character-n-gram bag-of-words embedding (numpy + torch compatible).
+        Character trigrams (rather than whole words) make the vector typo-robust —
+        'comput' and 'compute' share most trigrams and therefore score as similar —
+        which is what the hybrid morphing similarity relies on. Whole-word tokens are
+        also mixed in so exact-word matches stay strong."""
+        text = text.lower()
         vec = np.zeros(self.vocab_size, dtype=np.float32)
+        words = re.findall(r'\b\w+\b', text)
+        features = list(words)  # whole-word features
         for w in words:
-            idx = hash(w) % self.vocab_size
+            padded = f"#{w}#"
+            for i in range(len(padded) - 2):  # character trigrams
+                features.append(padded[i:i + 3])
+        for f in features:
+            idx = self._stable_hash(f) % self.vocab_size
             vec[idx] += 1.0
         norm = np.linalg.norm(vec)
         if norm > 0:
@@ -364,16 +398,42 @@ class ProductionAdaptiveEngine:
         vec = self.calculate_vector_similarity(s1, s2)
         return (lev * 0.6 + vec * 0.4)  # Weighted hybrid
 
+    def _containment_score(self, proposal, reference):
+        """Fraction (0-100) of the reference's canonical tokens that appear in the
+        proposal's canonical tokens. Unlike symmetric edit distance, this rewards a
+        longer proposal that fully covers a shorter reference concept — the right
+        signal for 'is this concept supported by the proposal?' checks."""
+        ref_tokens = set(self._tokenize_synonyms(reference).split())
+        if not ref_tokens:
+            return 0.0
+        prop_tokens = set(self._tokenize_synonyms(proposal).split())
+        covered = len(ref_tokens & prop_tokens)
+        return 100.0 * covered / len(ref_tokens)
+
+    def semantic_match_score(self, a, b):
+        """Best-of similarity for verification decisions: the max of hybrid
+        similarity and directional containment in either direction. Robust to
+        length differences and synonym surface forms."""
+        return max(
+            self.hybrid_similarity(a, b),
+            self._containment_score(a, b),
+            self._containment_score(b, a),
+        )
+
     # --- ADVANCED RAG / EMBEDDINGS (Optional FAISS + sentence-transformers) ---
     def _get_semantic_model(self):
-        """Lazy load sentence-transformers model (all-MiniLM-L6-v2 by default)."""
+        """Lazy load the sentence-transformers model. The model name is configurable
+        via the ENGINE_EMBEDDING_MODEL env var (default all-MiniLM-L6-v2), so a
+        deployment can swap in a larger production embedding model without code
+        changes."""
         global _semantic_model
         if _semantic_model is None and SENTENCE_TRANSFORMERS_AVAILABLE:
+            model_name = os.getenv("ENGINE_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
             try:
-                _semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-                print("✅ [RAG] sentence-transformers model loaded for semantic embeddings.")
+                _semantic_model = SentenceTransformer(model_name)
+                print(f"✅ [RAG] sentence-transformers model '{model_name}' loaded for semantic embeddings.")
             except Exception as e:
-                print(f"⚠️ Could not load sentence-transformers: {e}")
+                print(f"⚠️ Could not load sentence-transformers model '{model_name}': {e}")
                 _semantic_model = None
         return _semantic_model
 
@@ -388,55 +448,192 @@ class ProductionAdaptiveEngine:
 
     def advanced_chunk_text(self, text, strategy="semantic", chunk_size=512, overlap=50):
         """
-        Advanced chunking for RAG.
-        - 'fixed': simple overlapping chunks
-        - 'semantic': sentence-aware (basic) or uses embeddings for boundaries
-        - 'recursive': hierarchical (simplified)
+        Advanced chunking for RAG. All strategies honor `overlap` and never emit
+        empty chunks.
+        - 'fixed': sliding fixed-size windows with character overlap.
+        - 'semantic': sentence-aware packing whose boundaries are placed where the
+          embedding similarity between adjacent sentences drops (a topic shift),
+          falling back to size-based packing when embeddings are unavailable.
+        - 'recursive': hierarchical split on paragraph -> sentence -> word -> char
+          boundaries, only descending to a finer separator when a piece still
+          exceeds chunk_size (LangChain-style recursive character splitting).
         """
+        text = (text or "").strip()
+        if not text:
+            return []
+        overlap = max(0, min(overlap, chunk_size - 1))
+
         if strategy == "fixed":
-            chunks = []
-            for i in range(0, len(text), chunk_size - overlap):
-                chunks.append(text[i:i+chunk_size])
+            return self._chunk_fixed(text, chunk_size, overlap)
+        if strategy == "recursive":
+            return self._chunk_recursive(text, chunk_size, overlap)
+        if strategy == "semantic":
+            return self._chunk_semantic(text, chunk_size, overlap)
+        # Unknown strategy -> safe default
+        return self._chunk_fixed(text, chunk_size, overlap)
+
+    def _chunk_fixed(self, text, chunk_size, overlap):
+        """Sliding fixed-size character windows with overlap."""
+        step = max(1, chunk_size - overlap)
+        chunks = [text[i:i + chunk_size] for i in range(0, len(text), step)]
+        return [c.strip() for c in chunks if c.strip()]
+
+    def _add_overlap(self, chunks, overlap):
+        """Prepend a character tail of the previous chunk to each subsequent chunk."""
+        if overlap <= 0 or len(chunks) <= 1:
             return chunks
-        elif strategy == "semantic" and SENTENCE_TRANSFORMERS_AVAILABLE:
-            # Simple semantic chunking via sentence splitting + embedding similarity
-            sentences = re.split(r'(?<=[.!?])\s+', text)
-            chunks = []
-            current = ""
-            for sent in sentences:
-                if len(current) + len(sent) > chunk_size:
-                    if current:
-                        chunks.append(current.strip())
-                    current = sent
-                else:
-                    current += " " + sent
-            if current:
+        out = [chunks[0]]
+        for prev, cur in zip(chunks, chunks[1:]):
+            tail = prev[-overlap:]
+            out.append((tail + " " + cur).strip())
+        return out
+
+    def _chunk_semantic(self, text, chunk_size, overlap):
+        """Sentence packing with embedding-based boundary detection.
+        A new chunk is started when adding a sentence would exceed chunk_size, or
+        when the semantic similarity to the running chunk drops below a threshold."""
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+        if not sentences:
+            return self._chunk_fixed(text, chunk_size, overlap)
+
+        boundary_threshold = 0.35  # cosine below this => topic shift => new chunk
+        chunks = []
+        current = sentences[0]
+        for sent in sentences[1:]:
+            too_big = len(current) + 1 + len(sent) > chunk_size
+            topic_shift = False
+            if not too_big:
+                try:
+                    a = np.asarray(self.get_semantic_embedding(current), dtype=np.float32).ravel()
+                    b = np.asarray(self.get_semantic_embedding(sent), dtype=np.float32).ravel()
+                    if a.shape == b.shape:
+                        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
+                        topic_shift = float(np.dot(a, b) / denom) < boundary_threshold
+                except Exception:
+                    topic_shift = False
+            if too_big or topic_shift:
                 chunks.append(current.strip())
-            return chunks
-        else:
-            # Fallback
-            return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+                current = sent
+            else:
+                current += " " + sent
+        if current.strip():
+            chunks.append(current.strip())
+        return self._add_overlap(chunks, overlap)
+
+    def _chunk_recursive(self, text, chunk_size, overlap, separators=None):
+        """Hierarchical split: try coarse separators first, recurse into finer ones
+        only for pieces still larger than chunk_size, then pack adjacent pieces."""
+        if separators is None:
+            separators = ["\n\n", "\n", ". ", " ", ""]
+        if len(text) <= chunk_size:
+            return [text.strip()] if text.strip() else []
+
+        sep = separators[0]
+        rest = separators[1:]
+        if sep == "":
+            # Base case: hard character split
+            return self._chunk_fixed(text, chunk_size, overlap)
+
+        pieces = text.split(sep)
+        atoms = []
+        for piece in pieces:
+            piece = piece.strip()
+            if not piece:
+                continue
+            if len(piece) > chunk_size and rest:
+                atoms.extend(self._chunk_recursive(piece, chunk_size, overlap, rest))
+            else:
+                atoms.append(piece)
+
+        # Greedily pack atoms up to chunk_size
+        packed = []
+        current = ""
+        for atom in atoms:
+            if not current:
+                current = atom
+            elif len(current) + 1 + len(atom) <= chunk_size:
+                current += " " + atom
+            else:
+                packed.append(current)
+                current = atom
+        if current:
+            packed.append(current)
+        return self._add_overlap(packed, overlap)
+
+    # Common words that a capitalization heuristic would otherwise mis-flag as entities.
+    _ENTITY_STOPWORDS = frozenset({
+        "The", "A", "An", "This", "That", "These", "Those", "It", "They", "We",
+        "I", "You", "He", "She", "In", "On", "At", "For", "And", "But", "Or",
+        "If", "When", "While", "As", "To", "Of", "By", "With", "From",
+    })
+
+    def _extract_entities(self, text):
+        """Lightweight, dependency-free entity extraction: contiguous runs of
+        Capitalized words (optionally joined by 'of'/'and'), minus sentence-initial
+        stopwords. Not as accurate as spaCy/NER, but real, deterministic, and
+        adequate for seeding the KG. Returns a list of unique entity strings."""
+        candidates = re.findall(
+            r'\b[A-Z][a-zA-Z0-9]+(?:\s+(?:of|and|the)?\s*[A-Z][a-zA-Z0-9]+)*\b', text
+        )
+        entities = []
+        for cand in candidates:
+            cand = cand.strip()
+            words = cand.split()
+            # Drop a leading standalone stopword (e.g. "The Engine" -> "Engine").
+            if len(words) > 1 and words[0] in self._ENTITY_STOPWORDS:
+                cand = " ".join(words[1:])
+            if not cand or cand in self._ENTITY_STOPWORDS:
+                continue
+            if cand not in entities:
+                entities.append(cand)
+        return entities
+
+    def _store_entities(self, cursor, entities, source):
+        """Upsert entities into kg_entities and record co-occurrence relations."""
+        for ent in entities:
+            entity_id = ent.lower().replace(" ", "_")
+            emb = self.get_semantic_embedding(ent)
+            emb_blob = emb.tobytes() if hasattr(emb, "tobytes") else json.dumps(
+                emb.tolist() if hasattr(emb, "tolist") else list(emb)
+            )
+            cursor.execute('''
+                INSERT OR REPLACE INTO kg_entities (entity_id, label, properties, embedding, source)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (entity_id, ent, json.dumps({"surface": ent}), emb_blob, source))
+        # Co-occurrence relations between entities found in the same chunk.
+        for a, b in zip(entities, entities[1:]):
+            cursor.execute('''
+                INSERT INTO kg_relations (source_id, target_id, relation_type, properties, confidence)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (a.lower().replace(" ", "_"), b.lower().replace(" ", "_"),
+                  "co_occurs_with", json.dumps({"source": source}), 0.5))
 
     def ingest_documents(self, documents, strategy="semantic"):
-        """Ingest documents into RAG + KG (chunks + embeddings + basic entity extraction)."""
+        """Ingest documents into RAG + KG: chunk, embed, and store each chunk in
+        rag_chunks, and extract entities/co-occurrence relations into the KG.
+        Returns the total number of chunks ingested (for accurate reporting)."""
         print(f"📥 [RAG] Ingesting {len(documents)} documents with {strategy} chunking...")
+        total_chunks = 0
         for doc in documents:
             chunks = self.advanced_chunk_text(doc, strategy=strategy)
             for i, chunk in enumerate(chunks):
                 emb = self.get_semantic_embedding(chunk)
-                # Store in rag_chunks
+                entities = self._extract_entities(chunk)
                 with self._lock:
                     conn = sqlite3.connect(self.db_path)
                     cursor = conn.cursor()
                     cursor.execute('''
                         INSERT INTO rag_chunks (content, embedding, metadata)
                         VALUES (?, ?, ?)
-                    ''', (chunk, emb.tobytes() if hasattr(emb, 'tobytes') else json.dumps(emb.tolist()), 
-                          json.dumps({"source": "ingest", "chunk_id": i})))
+                    ''', (chunk, emb.tobytes() if hasattr(emb, 'tobytes') else json.dumps(emb.tolist()),
+                          json.dumps({"source": "ingest", "chunk_id": i, "entities": entities})))
+                    self._store_entities(cursor, entities, source="ingest")
                     conn.commit()
                     conn.close()
-        print("✅ [RAG] Ingestion complete. Chunks stored with embeddings.")
+                total_chunks += 1
+        print(f"✅ [RAG] Ingestion complete. {total_chunks} chunks stored with embeddings + KG entities.")
         self.update_faiss_after_ingest()  # Keep persistent index in sync
+        return total_chunks
 
     # --- PERSISTENT FAISS INDEX MANAGEMENT ---
     def build_faiss_index(self, force_rebuild=False):
@@ -483,7 +680,10 @@ class ProductionAdaptiveEngine:
             return False
 
         embeddings_np = np.array(embeddings).astype('float32')
-        self.faiss_index = faiss.IndexFlatIP(dimension)
+        self.faiss_index = self._make_faiss_index(dimension, len(embeddings_np))
+        # IVF indexes must be trained before adding vectors.
+        if hasattr(self.faiss_index, "is_trained") and not self.faiss_index.is_trained:
+            self.faiss_index.train(embeddings_np)
         self.faiss_index.add(embeddings_np)
 
         # Save persistently
@@ -491,11 +691,26 @@ class ProductionAdaptiveEngine:
             faiss.write_index(self.faiss_index, self.faiss_index_path)
             with open(self.faiss_index_path + ".contents.json", "w") as f:
                 json.dump(self.faiss_contents, f)
-            print(f"✅ [FAISS] Persistent index saved to {self.faiss_index_path} ({len(embeddings)} vectors)")
+            print(f"✅ [FAISS] Persistent index ({type(self.faiss_index).__name__}) "
+                  f"saved to {self.faiss_index_path} ({len(embeddings)} vectors)")
         except Exception as e:
             print(f"⚠️ Could not save FAISS index: {e}")
 
         return True
+
+    def _make_faiss_index(self, dimension, n_vectors):
+        """Choose a FAISS index type by corpus size, for production-scale retrieval.
+        Small corpora use an exact inner-product index (best recall, no training);
+        larger corpora use an approximate HNSW graph index for sub-linear search.
+        Thresholds are overridable via ENGINE_FAISS_HNSW_THRESHOLD."""
+        hnsw_threshold = int(os.getenv("ENGINE_FAISS_HNSW_THRESHOLD", "10000"))
+        if n_vectors < hnsw_threshold:
+            return faiss.IndexFlatIP(dimension)
+        # HNSW: approximate, memory-resident, no training required, strong recall.
+        index = faiss.IndexHNSWFlat(dimension, 32, faiss.METRIC_INNER_PRODUCT)
+        index.hnsw.efConstruction = 200
+        index.hnsw.efSearch = 64
+        return index
 
     def load_faiss_index(self):
         """Load existing persistent FAISS index if available."""
@@ -564,6 +779,115 @@ class ProductionAdaptiveEngine:
         """Rebuild FAISS index after new documents are ingested."""
         if FAISS_AVAILABLE:
             self.build_faiss_index(force_rebuild=True)
+
+    # --- ADVANCED RETRIEVAL: query rewriting, cross-encoder re-ranking, agentic multi-hop ---
+    def _rewrite_query(self, query):
+        """LLM-based query rewriting: expand/clarify the query for better recall.
+        Falls back to the original query on any failure (including mock LLM)."""
+        prompt = (
+            f"Rewrite the following search query to maximize retrieval recall — "
+            f"expand abbreviations and add key synonyms, but keep it concise and on-topic. "
+            f"Return ONLY the rewritten query, no preamble.\nQuery: {query}"
+        )
+        try:
+            result = self.llm_call(prompt, max_tokens=64)
+            text = result.get("content", "") if isinstance(result, dict) else str(result)
+            text = text.strip().strip('"')
+            # Guard against mock/garbage responses: require it to look like a query.
+            if text and 2 <= len(text) <= 400 and "\n" not in text:
+                return text
+        except Exception as e:
+            print(f"⚠️ [RAG] Query rewrite failed, using original: {e}")
+        return query
+
+    def _get_cross_encoder(self):
+        """Lazy-load an optional cross-encoder re-ranker (model configurable via
+        ENGINE_RERANK_MODEL). Returns None when the dependency is unavailable."""
+        global _cross_encoder_model
+        if not CROSS_ENCODER_AVAILABLE:
+            return None
+        if _cross_encoder_model is None:
+            model_name = os.getenv("ENGINE_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+            try:
+                _cross_encoder_model = CrossEncoder(model_name)
+                print(f"✅ [RAG] cross-encoder re-ranker '{model_name}' loaded.")
+            except Exception as e:
+                print(f"⚠️ Could not load cross-encoder '{model_name}': {e}")
+                _cross_encoder_model = None
+        return _cross_encoder_model
+
+    def _rerank(self, query, candidates, k):
+        """Re-rank candidate passages against the query with a cross-encoder when
+        available; otherwise preserve the (already embedding-ranked) input order."""
+        if not candidates:
+            return []
+        model = self._get_cross_encoder()
+        if model is None:
+            return candidates[:k]
+        try:
+            scores = model.predict([(query, c) for c in candidates])
+            ranked = [c for _, c in sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)]
+            return ranked[:k]
+        except Exception as e:
+            print(f"⚠️ [RAG] Re-rank failed, falling back to base order: {e}")
+            return candidates[:k]
+
+    def retrieve_context_advanced(self, query, k=5, rewrite=True, rerank=True,
+                                  agentic=False, max_hops=3):
+        """Production retrieval pipeline layering three optional stages over
+        `semantic_retrieve_context`:
+          1. query rewriting (LLM) for better recall,
+          2. cross-encoder re-ranking for better precision,
+          3. agentic multi-hop expansion (the LLM proposes follow-up queries until
+             it deems the gathered context sufficient or max_hops is reached).
+        Returns a de-duplicated list of at most `k` (or, in agentic mode, up to
+        `k * max_hops`) context passages."""
+        search_query = self._rewrite_query(query) if rewrite else query
+        pool = self._safe_retrieve(search_query, k * 3)
+        results = self._rerank(query, pool, k) if rerank else pool[:k]
+
+        if not agentic:
+            return results
+
+        gathered = list(dict.fromkeys(results))  # preserve order, de-dupe
+        for _ in range(max_hops - 1):
+            follow_up = self._propose_follow_up_query(query, gathered)
+            if not follow_up:
+                break
+            more = self._safe_retrieve(follow_up, k * 3)
+            more = self._rerank(follow_up, more, k) if rerank else more[:k]
+            new_items = [c for c in more if c not in gathered]
+            if not new_items:
+                break
+            gathered.extend(new_items)
+        return gathered
+
+    def _safe_retrieve(self, query, k):
+        """Retrieve context, returning [] instead of the 'no context' sentinel."""
+        res = self.semantic_retrieve_context(query, k=k)
+        if not res or (len(res) == 1 and res[0].startswith("No RAG context")):
+            return []
+        return res
+
+    def _propose_follow_up_query(self, original_query, gathered):
+        """Ask the LLM whether more retrieval is needed; return a follow-up query
+        string, or None/empty to stop the agentic loop."""
+        context_preview = " | ".join(g[:120] for g in gathered[:5])
+        prompt = (
+            f"Original question: {original_query}\n"
+            f"Context gathered so far: {context_preview}\n"
+            f"If the context is sufficient to answer, reply exactly DONE. "
+            f"Otherwise reply with ONE short follow-up search query that would fill the gap."
+        )
+        try:
+            result = self.llm_call(prompt, max_tokens=48)
+            text = result.get("content", "") if isinstance(result, dict) else str(result)
+            text = text.strip().strip('"')
+            if not text or text.upper().startswith("DONE") or "\n" in text:
+                return None
+            return text if 2 <= len(text) <= 400 else None
+        except Exception:
+            return None
 
     def _trigger_auto_learning(self, input_text, target_text, task_id, is_low_confidence):
         """Unsupervised context mapping routine to trace, segregate, and extract unknown words."""
@@ -875,8 +1199,11 @@ class ProductionAdaptiveEngine:
         Self-Auditor / Self-Verifier: Validates LLM proposals using engine's similarity + rules.
         Returns verified proposal or None if low confidence.
         """
-        # Compute similarity to target or context
-        sim_score = self.calculate_similarity(proposal, context_text or self.raw_target)
+        # Compute similarity to target or context. Use the containment-aware
+        # semantic score so a proposal that fully covers the context (but is longer)
+        # is not penalized by raw edit distance.
+        context = context_text or self.raw_target
+        sim_score = self.semantic_match_score(proposal, context)
         print(f"🔍 [Self-Auditor] Proposal similarity: {sim_score:.1f}% to context.")
         
         if sim_score >= min_confidence:
@@ -913,45 +1240,19 @@ class ProductionAdaptiveEngine:
                     print(f"⚠️ [Symbolic] Potential conflict for word '{w}'.")
                     # In full impl: compare proposed vs existing
         
-        # 3. Domain-specific symbolic rules (e.g., valid tokens for analytics)
+        # 3. Domain-specific symbolic rules. Check the CANONICAL (synonym-expanded)
+        # form so a domain word like "analytics" (-> data_token) counts even though
+        # the literal token string is absent from the surface text. Presence of a
+        # recognized domain concept is sufficient symbolic evidence on its own.
         valid_tokens = {"compute_token", "data_token", "structure_token"}
-        if any(token in proposal for token in valid_tokens):
+        canonical = self._tokenize_synonyms(proposal)
+        if any(token in canonical for token in valid_tokens):
             print("✅ [Symbolic Verifier] Domain rules passed.")
-        else:
-            print("⚠️ [Symbolic] No recognized domain token - flagging.")
-            # Still allow with lower confidence in hybrid
-        
-        # 4. Cross-verify with engine similarity and self-auditor
-        sim = self.calculate_similarity(proposal, self.raw_target)
-        if sim > 60.0:
-            print("✅ [Symbolic] Consistent with core target.")
             return True
-        return False
-        
-        # 1. Structural / Syntax checks
-        if not proposal or len(proposal.strip()) < 3:
-            print("❌ [Symbolic] Empty or too short proposal rejected.")
-            return False
-        
-        # 2. Consistency with existing dictionary (no conflicting mappings)
-        words = re.findall(r'\b\w+\b', proposal.lower())
-        with self._lock:
-            for w in words:
-                if w in self.synonym_dictionary and "->" in proposal:
-                    # Mock conflict detection
-                    print(f"⚠️ [Symbolic] Potential conflict for word '{w}'.")
-                    # In full impl: compare proposed vs existing
-        
-        # 3. Domain-specific symbolic rules (e.g., valid tokens for analytics)
-        valid_tokens = {"compute_token", "data_token", "structure_token"}
-        if any(token in proposal for token in valid_tokens):
-            print("✅ [Symbolic Verifier] Domain rules passed.")
-        else:
-            print("⚠️ [Symbolic] No recognized domain token - flagging.")
-            # Still allow with lower confidence in hybrid
-        
-        # 4. Cross-verify with engine similarity and self-auditor
-        sim = self.calculate_similarity(proposal, self.raw_target)
+        print("⚠️ [Symbolic] No recognized domain token - checking semantic consistency.")
+
+        # 4. No domain token: fall back to semantic consistency with the core target.
+        sim = self.semantic_match_score(proposal, self.raw_target)
         if sim > 60.0:
             print("✅ [Symbolic] Consistent with core target.")
             return True
