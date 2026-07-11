@@ -1,0 +1,14 @@
+# Prometheus scrape configuration for the Self-Morphing Adaptive Recursion Engine.
+# The engine exposes Prometheus metrics at GET /metrics (unauthenticated by
+# convention) on its API port.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: morphic-engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["engine:8000"]
+        labels:
+          service: morphic-engine

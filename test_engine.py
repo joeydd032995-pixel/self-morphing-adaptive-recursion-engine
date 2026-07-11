@@ -420,5 +420,63 @@ class TestGnnTrained:
         assert len(links) <= 2
 
 
+class TestMetricsSnapshot:
+    """Engine observability snapshot + populated learning-metric fields."""
+
+    def test_snapshot_has_numeric_fields(self, engine):
+        snap = engine.get_metrics_snapshot()
+        for key in ("total_proposals", "accepted_learnings", "rejection_rate",
+                    "avg_confidence", "synonym_count", "rag_chunks",
+                    "kg_entities", "kg_relations", "has_neo4j"):
+            assert key in snap
+            assert isinstance(snap[key], (int, float))
+
+    def test_rejection_rate_and_history_populated(self, engine):
+        engine.learning_metrics["learning_history"].append({"outcome": "accepted"})
+        engine.learning_metrics["learning_history"].append({"outcome": "rejected"})
+        engine._update_rejection_rate()
+        assert abs(engine.learning_metrics["rejection_rate"] - 0.5) < 1e-9
+        assert engine.get_metrics_snapshot()["learning_history_len"] == 2
+
+    def test_snapshot_reflects_ingested_counts(self, engine):
+        engine.ingest_documents([SAMPLE_DOC], strategy="fixed")
+        snap = engine.get_metrics_snapshot()
+        assert snap["rag_chunks"] >= 1
+        assert snap["kg_entities"] >= 1
+
+
+class TestPrometheusEndpoint:
+    """/metrics exposition via FastAPI TestClient (skips if fastapi absent)."""
+
+    def _client(self):
+        try:
+            os.environ.setdefault("ENGINE_API_KEY", "test-key")
+            import importlib
+            import fastapi_server
+            importlib.reload(fastapi_server)
+            from fastapi.testclient import TestClient
+            return fastapi_server, TestClient(fastapi_server.app)
+        except Exception as e:
+            pytest.skip(f"fastapi stack unavailable: {e}")
+
+    def test_metrics_endpoint(self):
+        mod, client = self._client()
+        resp = client.get("/metrics")
+        if not mod.PROMETHEUS_AVAILABLE:
+            assert resp.status_code == 501
+        else:
+            assert resp.status_code == 200
+            body = resp.text
+            assert "morphic_total_proposals" in body
+            assert "# HELP" in body and "# TYPE" in body
+
+    def test_metrics_json_requires_auth(self):
+        mod, client = self._client()
+        assert client.get("/metrics.json").status_code in (401, 403)
+        ok = client.get("/metrics.json", headers={"X-API-Key": "test-key"})
+        assert ok.status_code == 200
+        assert "snapshot" in ok.json()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=line"])

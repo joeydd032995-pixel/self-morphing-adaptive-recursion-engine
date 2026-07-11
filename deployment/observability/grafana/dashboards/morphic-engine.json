@@ -1,0 +1,82 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "title": "Self-Morphing Adaptive Recursion Engine",
+  "uid": "morphic-engine",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Proposals",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "morphic_total_proposals", "refId": "A" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Accepted Learnings",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "morphic_accepted_learnings", "refId": "A" }]
+    },
+    {
+      "id": 3,
+      "type": "gauge",
+      "title": "Rejection Rate",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "unit": "percentunit" } },
+      "targets": [{ "expr": "morphic_rejection_rate", "refId": "A" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Avg Confidence",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [{ "expr": "morphic_avg_confidence", "refId": "A" }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Query Explosion Events",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [{ "expr": "morphic_explosion_events", "refId": "A" }]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Learning History Length",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [{ "expr": "morphic_learning_history_len", "refId": "A" }]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Knowledge Base Size (RAG chunks / KG entities / relations)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "morphic_rag_chunks", "refId": "A", "legendFormat": "RAG chunks" },
+        { "expr": "morphic_kg_entities", "refId": "B", "legendFormat": "KG entities" },
+        { "expr": "morphic_kg_relations", "refId": "C", "legendFormat": "KG relations" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "FAISS Vectors",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 14 },
+      "targets": [{ "expr": "morphic_faiss_vectors", "refId": "A" }]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Admin Review Queue",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 14 },
+      "targets": [{ "expr": "morphic_admin_queue_size", "refId": "A" }]
+    }
+  ]
+}

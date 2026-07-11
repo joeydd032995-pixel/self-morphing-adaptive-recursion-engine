@@ -23,6 +23,12 @@ from organized_self_morphing_engine import (
     SENTENCE_TRANSFORMERS_AVAILABLE,
 )
 
+try:
+    from prometheus_client import CollectorRegistry, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
 # Initialize engine (singleton for demo; in prod use dependency injection or pool)
 engine = ProductionAdaptiveEngine(target_solution_text="General Reasoning", similarity_threshold=80.0)
 
@@ -153,12 +159,32 @@ async def self_teach(request: TeachRequest, api_key: str = Depends(verify_api_ke
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/metrics", tags=["Observability"])
-async def get_metrics(api_key: str = Depends(verify_api_key)):
-    """Get learning metrics, DB stats, etc."""
+async def get_metrics():
+    """Prometheus metrics endpoint (text exposition format) for scraping.
+    Unauthenticated by convention so Prometheus can scrape it; exposes only
+    non-sensitive operational counters/gauges. Returns 501 if prometheus_client
+    is not installed — use /metrics.json for the plain-JSON view."""
+    if not PROMETHEUS_AVAILABLE:
+        raise HTTPException(status_code=501,
+                            detail="prometheus_client not installed; use /metrics.json")
+    from fastapi import Response
+    registry = CollectorRegistry()
+    snapshot = engine.get_metrics_snapshot()
+    for name, value in snapshot.items():
+        try:
+            g = Gauge(f"morphic_{name}", f"Self-morphing engine metric: {name}", registry=registry)
+            g.set(float(value))
+        except Exception:
+            continue
+    return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/metrics.json", tags=["Observability"])
+async def get_metrics_json(api_key: str = Depends(verify_api_key)):
+    """Plain-JSON metrics view (authenticated) — the previous /metrics payload."""
     try:
-        conn = engine.db_path  # simple access
         return {
             "learning_metrics": engine.learning_metrics,
+            "snapshot": engine.get_metrics_snapshot(),
             "synonym_count": len(engine.synonym_dictionary),
             "has_neo4j": getattr(engine, 'has_neo4j', False),
             "faiss_available": FAISS_AVAILABLE,
