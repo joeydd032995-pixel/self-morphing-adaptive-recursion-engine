@@ -576,17 +576,20 @@ class ProductionAdaptiveEngine:
         return torch.tensor(vec, dtype=torch.float32)
 
     def calculate_vector_similarity(self, s1, s2):
-        """Cosine similarity on embeddings for rich semantic matching."""
+        """Cosine similarity on embeddings for rich semantic matching.
+        Clamped to [0, 100] — floating-point rounding can push a cosine of two
+        identical unit vectors marginally above 1.0."""
         emb1 = self._compute_embedding(s1)
         emb2 = self._compute_embedding(s2)
         cos_sim = torch.nn.functional.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).item()
-        return max(0.0, cos_sim) * 100.0  # Scale to percentage
+        return min(1.0, max(0.0, cos_sim)) * 100.0  # Scale to percentage, clamped
 
     def hybrid_similarity(self, s1, s2):
-        """Combined Levenshtein + Vector embedding for robust matching."""
+        """Combined Levenshtein + Vector embedding for robust matching.
+        Result is clamped to [0, 100]."""
         lev = self.calculate_similarity(s1, s2)
         vec = self.calculate_vector_similarity(s1, s2)
-        return (lev * 0.6 + vec * 0.4)  # Weighted hybrid
+        return min(100.0, max(0.0, lev * 0.6 + vec * 0.4))  # Weighted hybrid, clamped
 
     def _containment_score(self, proposal, reference):
         """Fraction (0-100) of the reference's canonical tokens that appear in the
