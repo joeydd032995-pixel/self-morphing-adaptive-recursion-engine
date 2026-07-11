@@ -433,12 +433,11 @@ Query DB directly for analytics or build dashboards on explosion counts, learnin
 
 **Mid-term**:
 - Learned GNN (PyTorch Geometric) for dynamic path prediction and node classification.
-- Multi-agent orchestration hub (integrate with external agents like Manus/Goose).
+- Multi-agent orchestration hub (integrate with external agents like Manus/Goose/Claude/GPT etc.).
 - Advanced RAG: query rewriting, re-ranking models, agentic retrieval.
 - iOS / on-device companion (agentic shortcuts calling the engine API).
 
 **Long-term / Research**:
-- Full custom language (Aether-like) for morphic node definitions interpretable by LLMs.
 - Continuous online learning without catastrophic forgetting.
 - Formal verification of morphing safety properties.
 - Production multi-tenant deployment with tenant-isolated graphs and billing.
