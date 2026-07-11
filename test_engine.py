@@ -19,6 +19,7 @@ import sqlite3
 import tempfile
 import shutil
 import torch
+from unittest.mock import MagicMock
 
 # Fixture for clean engine instance (uses temp DB to avoid polluting main engine_logs.db)
 @pytest.fixture(scope="function")
@@ -251,6 +252,87 @@ class TestFaissIndexSelection:
             assert "HNSW" in type(idx).__name__
         finally:
             del os.environ["ENGINE_FAISS_HNSW_THRESHOLD"]
+
+
+class TestCypherBuilder:
+    """Pure Cypher builders — no driver required."""
+
+    def test_sanitize_rel_type(self, engine):
+        assert engine._sanitize_rel_type("co-occurs with") == "CO_OCCURS_WITH"
+        assert engine._sanitize_rel_type("") == "RELATED_TO"
+        assert engine._sanitize_rel_type("a`b; DROP") == "A_B__DROP"
+
+    def test_entity_merge_parameterized(self, engine):
+        q, p = engine.build_entity_merge("paris", "Paris", {"surface": "Paris"})
+        assert "MERGE (e:Entity {id: $id})" in q
+        assert p["id"] == "paris" and p["label"] == "Paris"
+        assert json.loads(p["properties"]) == {"surface": "Paris"}
+
+    def test_relation_merge_type_interpolated_values_parameterized(self, engine):
+        q, p = engine.build_relation_merge("a", "b", "co_occurs_with", 0.5, {"src": "x"})
+        assert "[r:CO_OCCURS_WITH]" in q
+        assert p["source_id"] == "a" and p["target_id"] == "b" and p["confidence"] == 0.5
+        # Values must be parameters, never interpolated.
+        assert "0.5" not in q and "$confidence" in q
+
+
+class TestNeo4jSync:
+    """Bidirectional sync using a mocked driver (no live Neo4j / no neo4j package)."""
+
+    def _mock_engine_with_driver(self, engine):
+        driver = MagicMock()
+        session = MagicMock()
+        # session used as a context manager
+        driver.session.return_value.__enter__.return_value = session
+        engine.neo4j_driver = driver
+        engine.has_neo4j = True
+        return driver, session
+
+    def test_sync_to_neo4j_runs_cypher(self, engine):
+        # Seed SQLite KG.
+        conn = sqlite3.connect(engine.db_path)
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO kg_entities (entity_id,label,properties,source) VALUES (?,?,?,?)",
+                    ("paris", "Paris", "{}", "test"))
+        cur.execute("INSERT OR REPLACE INTO kg_entities (entity_id,label,properties,source) VALUES (?,?,?,?)",
+                    ("france", "France", "{}", "test"))
+        cur.execute("INSERT INTO kg_relations (source_id,target_id,relation_type,properties,confidence) VALUES (?,?,?,?,?)",
+                    ("paris", "france", "capital_of", "{}", 0.9))
+        conn.commit(); conn.close()
+
+        driver, session = self._mock_engine_with_driver(engine)
+        summary = engine.kg_sync_to_neo4j()
+        assert summary == {"synced": True, "entities": 2, "relations": 1}
+        assert session.run.call_count == 3  # 2 entities + 1 relation
+
+    def test_sync_from_neo4j_upserts_sqlite(self, engine):
+        driver, session = self._mock_engine_with_driver(engine)
+        # First .run() call -> entities, second -> relations.
+        entities = [{"id": "berlin", "label": "Berlin", "properties": "{}"}]
+        relations = [{"source_id": "berlin", "target_id": "germany",
+                      "relation_type": "CAPITAL_OF", "confidence": 0.8, "properties": "{}"}]
+        session.run.side_effect = [entities, relations]
+
+        summary = engine.kg_sync_from_neo4j()
+        assert summary["synced"] is True
+        conn = sqlite3.connect(engine.db_path)
+        cur = conn.cursor()
+        assert cur.execute("SELECT label FROM kg_entities WHERE entity_id='berlin'").fetchone()[0] == "Berlin"
+        assert cur.execute("SELECT COUNT(*) FROM kg_relations WHERE source_id='berlin'").fetchone()[0] == 1
+        conn.close()
+
+    def test_sync_noop_without_connection(self, engine):
+        # No driver connected -> graceful no-op, no exception.
+        engine.has_neo4j = False
+        assert engine.kg_sync_to_neo4j() == {"synced": False, "entities": 0, "relations": 0}
+        assert engine.kg_sync_from_neo4j() == {"synced": False, "entities": 0, "relations": 0}
+
+    def test_connect_graceful_when_driver_absent(self, engine):
+        import organized_self_morphing_engine as ose
+        if ose.NEO4J_AVAILABLE:
+            pytest.skip("neo4j installed; absent-path not exercised")
+        assert engine.connect_neo4j() is False
+        assert engine.has_neo4j is False
 
 
 if __name__ == "__main__":

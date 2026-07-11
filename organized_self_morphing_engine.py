@@ -37,6 +37,12 @@ except ImportError:
     CROSS_ENCODER_AVAILABLE = False
     _cross_encoder_model = None
 
+try:
+    from neo4j import GraphDatabase
+    NEO4J_AVAILABLE = True
+except ImportError:
+    NEO4J_AVAILABLE = False
+
 # =====================================================================
 # 1. THE DATA STRUCTURE LAYOUT (Heterogeneous Morphic Graph Nodes)
 # =====================================================================
@@ -296,27 +302,160 @@ class ProductionAdaptiveEngine:
                 item["status"] = "REJECTED"
                 print(f"🗑️ [Admin Interface] Rejected Task [{task_id}]. Discarding execution branch.")
 
-    # --- NEO4J & EXTERNAL KG INTEGRATION (Non-breaking stubs + hooks for PoG/KG-LLM) ---
-    def connect_neo4j(self, uri="bolt://localhost:7687", user="neo4j", password="password"):
-        """Stub for external Neo4j connection. Install 'neo4j' driver for full bidirectional sync.
-        Enables advanced KG persistence for multi-hop PoG planning and entity-relation storage."""
-        try:
-            # from neo4j import GraphDatabase
-            # self.neo4j_driver = GraphDatabase.driver(uri, auth=(user, password))
-            print("✅ Neo4j connection stub activated. Ready for full driver integration and bidirectional sync.")
-            self.has_neo4j = True
-        except Exception:
+    # --- NEO4J & EXTERNAL KG INTEGRATION (real driver + Cypher builder + bidirectional sync) ---
+    def connect_neo4j(self, uri=None, user=None, password=None):
+        """Open a real Neo4j connection using the official driver. Connection
+        parameters default to the NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD env vars
+        (matching docker-compose). Sets self.has_neo4j only when the driver loads
+        AND connectivity is verified; otherwise the engine keeps using its rich
+        SQLite KG backend. Returns True on success."""
+        if not NEO4J_AVAILABLE:
             self.has_neo4j = False
-            print("⚠️ Neo4j driver not available (pip install neo4j). Using rich SQLite KG fallback with advanced schema.")
+            print("⚠️ neo4j driver not installed (pip install neo4j). Using SQLite KG fallback.")
+            return False
+
+        uri = uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        user = user or os.getenv("NEO4J_USER", "neo4j")
+        password = password or os.getenv("NEO4J_PASSWORD", "password")
+        try:
+            self.neo4j_driver = GraphDatabase.driver(uri, auth=(user, password))
+            self.neo4j_driver.verify_connectivity()
+            self.has_neo4j = True
+            print(f"✅ [Neo4j] Connected to {uri} — external KG sync enabled.")
+            return True
+        except Exception as e:
+            self.has_neo4j = False
+            self.neo4j_driver = None
+            print(f"⚠️ [Neo4j] Connection failed ({e}). Using SQLite KG fallback.")
+            return False
+
+    def close_neo4j(self):
+        """Close the Neo4j driver if open (idempotent)."""
+        driver = getattr(self, "neo4j_driver", None)
+        if driver is not None:
+            try:
+                driver.close()
+            finally:
+                self.neo4j_driver = None
+                self.has_neo4j = False
+
+    @staticmethod
+    def _sanitize_rel_type(relation_type):
+        """Cypher relationship types cannot be parameterized, so they must be
+        interpolated — sanitize to an uppercase [A-Z0-9_] token to prevent
+        injection and produce a valid identifier."""
+        cleaned = re.sub(r'[^A-Za-z0-9_]', '_', str(relation_type or "")).strip('_').upper()
+        return cleaned or "RELATED_TO"
+
+    @classmethod
+    def build_entity_merge(cls, entity_id, label, properties):
+        """Build a parameterized Cypher MERGE for an entity node.
+        Returns (query, params). Pure — no driver required (unit-testable)."""
+        query = (
+            "MERGE (e:Entity {id: $id}) "
+            "SET e.label = $label, e.properties = $properties"
+        )
+        params = {
+            "id": entity_id,
+            "label": label,
+            "properties": json.dumps(properties) if not isinstance(properties, str) else properties,
+        }
+        return query, params
+
+    @classmethod
+    def build_relation_merge(cls, source_id, target_id, relation_type, confidence, properties=None):
+        """Build a parameterized Cypher MERGE for a typed, confidence-scored relation
+        between two entities. The relationship type is sanitized and interpolated
+        (Cypher can't parameterize it); all values are parameterized.
+        Returns (query, params). Pure — no driver required (unit-testable)."""
+        rel = cls._sanitize_rel_type(relation_type)
+        query = (
+            "MERGE (a:Entity {id: $source_id}) "
+            "MERGE (b:Entity {id: $target_id}) "
+            f"MERGE (a)-[r:{rel}]->(b) "
+            "SET r.confidence = $confidence, r.properties = $properties"
+        )
+        params = {
+            "source_id": source_id,
+            "target_id": target_id,
+            "confidence": confidence,
+            "properties": json.dumps(properties or {}),
+        }
+        return query, params
 
     def kg_sync_to_neo4j(self):
-        """Sync local KG entities/relations (with embeddings/confidence) to Neo4j.
-        Non-blocking; called after self-teaching or dynamic node attachment for external graph power."""
-        if getattr(self, 'has_neo4j', False):
-            print("🔄 Syncing KG entities/relations (embeddings + confidence) to Neo4j for PoG multi-hop...")
-            # TODO: Implement actual Cypher CREATE/MERGE for entities and relations using self.neo4j_driver
-        else:
-            print("Using SQLite KG backend (advanced schema with BLOB embeddings and confidence scoring).")
+        """Push all SQLite KG entities and relations to Neo4j via idempotent MERGE
+        Cypher (safe to call repeatedly). No-op with a clear message when Neo4j is
+        not connected. Returns a dict summary of what was synced."""
+        if not getattr(self, "has_neo4j", False) or getattr(self, "neo4j_driver", None) is None:
+            print("Using SQLite KG backend (Neo4j not connected).")
+            return {"synced": False, "entities": 0, "relations": 0}
+
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            entities = cursor.execute(
+                "SELECT entity_id, label, properties FROM kg_entities").fetchall()
+            relations = cursor.execute(
+                "SELECT source_id, target_id, relation_type, confidence, properties FROM kg_relations"
+            ).fetchall()
+            conn.close()
+
+        print(f"🔄 [Neo4j] Syncing {len(entities)} entities + {len(relations)} relations to Neo4j...")
+        with self.neo4j_driver.session() as session:
+            for entity_id, label, properties in entities:
+                q, p = self.build_entity_merge(entity_id, label, properties or "{}")
+                session.run(q, **p)
+            for source_id, target_id, rel_type, confidence, properties in relations:
+                q, p = self.build_relation_merge(
+                    source_id, target_id, rel_type, confidence, properties)
+                session.run(q, **p)
+        print("✅ [Neo4j] Sync-to complete.")
+        return {"synced": True, "entities": len(entities), "relations": len(relations)}
+
+    def kg_sync_from_neo4j(self):
+        """Pull entities and relations from Neo4j back into the SQLite KG so the two
+        stores stay consistent (bidirectional sync). Upserts entities and inserts
+        relations that are not already present. Returns a dict summary."""
+        if not getattr(self, "has_neo4j", False) or getattr(self, "neo4j_driver", None) is None:
+            print("Using SQLite KG backend (Neo4j not connected).")
+            return {"synced": False, "entities": 0, "relations": 0}
+
+        with self.neo4j_driver.session() as session:
+            ent_records = list(session.run(
+                "MATCH (e:Entity) RETURN e.id AS id, e.label AS label, e.properties AS properties"))
+            rel_records = list(session.run(
+                "MATCH (a:Entity)-[r]->(b:Entity) "
+                "RETURN a.id AS source_id, b.id AS target_id, type(r) AS relation_type, "
+                "r.confidence AS confidence, r.properties AS properties"))
+
+        n_ent = n_rel = 0
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            for rec in ent_records:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO kg_entities (entity_id, label, properties, source)
+                    VALUES (?, ?, ?, ?)
+                ''', (rec["id"], rec.get("label"), rec.get("properties") or "{}", "neo4j"))
+                n_ent += 1
+            for rec in rel_records:
+                # Avoid duplicating a relation that already exists.
+                exists = cursor.execute('''
+                    SELECT 1 FROM kg_relations
+                    WHERE source_id=? AND target_id=? AND relation_type=? LIMIT 1
+                ''', (rec["source_id"], rec["target_id"], rec["relation_type"])).fetchone()
+                if not exists:
+                    cursor.execute('''
+                        INSERT INTO kg_relations (source_id, target_id, relation_type, properties, confidence)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (rec["source_id"], rec["target_id"], rec["relation_type"],
+                          rec.get("properties") or "{}", rec.get("confidence")))
+                    n_rel += 1
+            conn.commit()
+            conn.close()
+        print(f"✅ [Neo4j] Sync-from complete: {n_ent} entities, {n_rel} new relations.")
+        return {"synced": True, "entities": n_ent, "relations": n_rel}
 
     # --- ANALYTICAL ALGORITHMIC FORMULAE ---
     def _tokenize_synonyms(self, text):
