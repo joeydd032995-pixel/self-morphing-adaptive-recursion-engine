@@ -1,10 +1,11 @@
 torch
 numpy
 networkx
-sqlite3
 fastapi
 uvicorn
 requests
+pytest
+sentence-transformers
 faiss-cpu  # optional, for vector DB
 groq  # optional
 openai  # optional

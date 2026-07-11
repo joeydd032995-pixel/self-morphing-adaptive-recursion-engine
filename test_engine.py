@@ -12,6 +12,7 @@ from organized_self_morphing_engine import ProductionAdaptiveEngine, MorphicText
 import json
 import tempfile
 import shutil
+import torch
 
 # Fixture for clean engine instance (uses temp DB to avoid polluting main engine_logs.db)
 @pytest.fixture(scope="function")

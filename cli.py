@@ -16,9 +16,14 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from organized_self_morphing_engine import ProductionAdaptiveEngine
+from organized_self_morphing_engine import (
+    ProductionAdaptiveEngine,
+    FAISS_AVAILABLE,
+    SENTENCE_TRANSFORMERS_AVAILABLE,
+)
 
 def main():
+    """Parse CLI arguments, initialize the engine, and dispatch to the selected subcommand."""
     parser = argparse.ArgumentParser(description="Self-Morphing Adaptive Recursion Engine CLI")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 

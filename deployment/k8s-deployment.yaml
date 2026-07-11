@@ -63,9 +63,13 @@ spec:
               name: morphic-secrets
               key: groq-api-key
               optional: true
+        - name: ENGINE_DB_PATH
+          value: /app/state/engine_logs.db
+        - name: ENGINE_FAISS_INDEX_PATH
+          value: /app/state/faiss_index.bin
         volumeMounts:
         - name: engine-data
-          mountPath: /app
+          mountPath: /app/state
         resources:
           requests:
             memory: "1Gi"

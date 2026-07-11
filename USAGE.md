@@ -93,11 +93,18 @@ print(engine.learning_metrics)
 uvicorn fastapi_server:app --reload --port 8000
 ```
 
+Set `ENGINE_API_KEY` before starting the server — there is no default key, and the server refuses to start without it:
+
+```bash
+export ENGINE_API_KEY=your-secret-key
+uvicorn fastapi_server:app --reload --port 8000
+```
+
 Then call it from your application:
 
 ```bash
 curl -X POST http://localhost:8000/pog/plan \
-  -H "X-API-Key: demo-secret-key-123" \
+  -H "X-API-Key: your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{"query": "Design a multi-agent system", "max_hops": 4}'
 ```

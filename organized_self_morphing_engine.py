@@ -38,6 +38,7 @@ class MorphicTextNode:
     between Linear, Tree, Nested, and Indirect configurations based on data input.
     """
     def __init__(self, node_id, key_phrase, node_type="linear"):
+        """Create a node with a normalized key phrase and empty linear/branch/inner-formula links."""
         self.id = node_id
         # Normalize text and clean spacing layout on ingestion
         self.key_phrase = key_phrase.lower().strip() 
@@ -65,12 +66,15 @@ class MorphicTextNode:
 
 class ProductionAdaptiveEngine:
     def __init__(self, target_solution_text, similarity_threshold=80.0):
+        """Initialize engine state: SQLite persistence, synonym dictionary, embeddings,
+        FAISS index, and the per-instance similarity cache."""
         self.raw_target = target_solution_text.lower().strip()
         self.threshold = similarity_threshold
         self.flag_buffer = 5.0  # Low confidence zone range (e.g., 80% to 85%)
         
-        # Thread safety for shared structures
-        self._lock = threading.Lock()
+        # Thread safety for shared structures (reentrant: attach_node holds this
+        # while calling symbolic_verifier, which acquires it again internally)
+        self._lock = threading.RLock()
         
         # Core Concept Tokens Table (Seed Vocabulary Matrix)
         self.synonym_dictionary = {
@@ -88,7 +92,7 @@ class ProductionAdaptiveEngine:
         self.explosion_log = []
         
         # SQLite Database Layer for Persistence
-        self.db_path = "engine_logs.db"
+        self.db_path = os.getenv("ENGINE_DB_PATH", "engine_logs.db")
         self._init_db()
         
         # Pre-process target string structure into absolute tokens
@@ -112,9 +116,13 @@ class ProductionAdaptiveEngine:
         
         # Persistent FAISS Index
         self.faiss_index = None
-        self.faiss_index_path = "faiss_index.bin"
+        self.faiss_index_path = os.getenv("ENGINE_FAISS_INDEX_PATH", "faiss_index.bin")
         self.faiss_contents = []
         self.load_faiss_index()  # Attempt to load existing persistent index on startup
+
+        # Per-instance memoized similarity (bound here, not on the class, so the
+        # cache dies with the instance instead of pinning every instance forever)
+        self.calculate_similarity = lru_cache(maxsize=512)(self._calculate_similarity_uncached)
 
     def _init_db(self):
         """Initialize SQLite database for persistent logging and mappings."""
@@ -226,12 +234,13 @@ class ProductionAdaptiveEngine:
         cleaned_token = concept_token.lower().strip()
         with self._lock:
             self.synonym_dictionary[cleaned_word] = cleaned_token
+            self.calculate_similarity.cache_clear()
             # Persist to DB
             conn = sqlite3.connect(self.db_path)
             conn.execute('PRAGMA journal_mode=WAL')
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT OR REPLACE INTO synonym_mappings 
+                INSERT OR REPLACE INTO synonym_mappings
                 (word, concept_token, learned_at) VALUES (?, ?, ?)
             ''', (cleaned_word, cleaned_token, datetime.datetime.now().isoformat()))
             conn.commit()
@@ -243,6 +252,7 @@ class ProductionAdaptiveEngine:
         with self._lock:
             if cleaned_word in self.synonym_dictionary:
                 del self.synonym_dictionary[cleaned_word]
+                self.calculate_similarity.cache_clear()
                 # Remove from DB
                 conn = sqlite3.connect(self.db_path)
                 conn.execute('PRAGMA journal_mode=WAL')
@@ -260,6 +270,7 @@ class ProductionAdaptiveEngine:
                 # Lock vocabulary translation rule to the production engine dictionary
                 with self._lock:
                     self.synonym_dictionary[item["word"]] = item["suggested_token"]
+                    self.calculate_similarity.cache_clear()
                     # Persist
                     conn = sqlite3.connect(self.db_path)
                     conn.execute('PRAGMA journal_mode=WAL')
@@ -304,10 +315,9 @@ class ProductionAdaptiveEngine:
         words = re.findall(r'\b\w+\b', text)
         return " ".join([self.synonym_dictionary.get(w, w) for w in words])
 
-    @lru_cache(maxsize=512)
-    def calculate_similarity(self, s1, s2):
+    def _calculate_similarity_uncached(self, s1, s2):
         """Vectorized Dynamic Programming Levenshtein Distance Matrix Calculation.
-        Cached for performance on repeated similar queries."""
+        Cached per-instance in __init__ (see self.calculate_similarity)."""
         t1 = self._tokenize_synonyms(s1)
         t2 = self._tokenize_synonyms(s2)
 
@@ -575,12 +585,13 @@ class ProductionAdaptiveEngine:
                         else:
                             with self._lock:
                                 self.synonym_dictionary[iw] = target_token
+                                self.calculate_similarity.cache_clear()
                                 # Persist to DB
                                 conn = sqlite3.connect(self.db_path)
                                 conn.execute('PRAGMA journal_mode=WAL')
                                 cursor = conn.cursor()
                                 cursor.execute('''
-                                    INSERT OR REPLACE INTO synonym_mappings 
+                                    INSERT OR REPLACE INTO synonym_mappings
                                     (word, concept_token, learned_at) VALUES (?, ?, ?)
                                 ''', (iw, target_token, datetime.datetime.now().isoformat()))
                                 conn.commit()
@@ -953,6 +964,7 @@ class ProductionAdaptiveEngine:
         Runs continuously with minimal human input.
         """
         def _teaching_iteration():
+            """Run one pass: pull unresolved cases from the DB, propose and verify mappings."""
             with self._lock:
                 conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
@@ -998,12 +1010,13 @@ class ProductionAdaptiveEngine:
                     conf = llm_suggestion.get("confidence", 85.0)
                     with self._lock:
                         self.synonym_dictionary[word] = token
+                        self.calculate_similarity.cache_clear()
                         # Persist
                         conn = sqlite3.connect(self.db_path)
                         cursor = conn.cursor()
                         cursor.execute('''
-                            INSERT OR REPLACE INTO synonym_mappings 
-                            (word, concept_token, learned_at, confidence, approved_by) 
+                            INSERT OR REPLACE INTO synonym_mappings
+                            (word, concept_token, learned_at, confidence, approved_by)
                             VALUES (?, ?, ?, ?, ?)
                         ''', (word, token, datetime.datetime.now().isoformat(), conf, 'self_teach'))
                         conn.commit()
@@ -1021,6 +1034,7 @@ class ProductionAdaptiveEngine:
         if background:
             # Run in background thread for continuous operation
             def background_loop():
+                """Run _teaching_iteration for max_iterations, sleeping between each pass."""
                 for i in range(max_iterations):
                     _teaching_iteration()
                     time.sleep(2)  # Simulate periodic runs
@@ -1040,11 +1054,16 @@ class ProductionAdaptiveEngine:
         try:
             import networkx as nx
             G = nx.DiGraph()
+            visited = set()
             def add_nodes(node, parent_id=None):
+                """Recursively add node and its linear/branch/inner-formula children to G."""
                 if not node: return
                 G.add_node(node.id, label=node.key_phrase, type=node.node_type)
                 if parent_id:
                     G.add_edge(parent_id, node.id)
+                if node.id in visited:
+                    return
+                visited.add(node.id)
                 if node.next_linear:
                     add_nodes(node.next_linear, node.id)
                 for branch in node.branches.values():
@@ -1146,10 +1165,11 @@ class ProductionAdaptiveEngine:
         reflection = self.llm_call(reflection_prompt, json_mode=True)
         
         verified = False
+        final_conf = current_conf
         if isinstance(reflection, dict):
             final_conf = reflection.get("final_confidence", current_conf)
             verified = self.symbolic_verifier(str(reflection), query) and self.self_auditor_verify(str(reflection), query)
-        
+
         if verified and final_conf > 70:
             result = f"✅ PoG Plan Complete: {sub_objectives[0]} → {memory['hops'][-1]['path'] if memory['hops'] else 'direct'} (conf {final_conf:.1f}%)"
         else:
@@ -1305,6 +1325,7 @@ if __name__ == "__main__":
     # For demo, override resolver temporarily
     original_resolver = engine._external_router_resolver
     def llm_resolver(routine):
+        """Route the 'llm_enhance' mutual routine to the LLM call, else fall back to the original resolver."""
         if routine == "llm_enhance":
             return MorphicTextNode("Temp", "llm resolved", "linear")  # Mock
         return original_resolver(routine)

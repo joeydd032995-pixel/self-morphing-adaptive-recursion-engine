@@ -16,7 +16,12 @@ import sys
 import sqlite3
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from organized_self_morphing_engine import ProductionAdaptiveEngine, MorphicTextNode
+from organized_self_morphing_engine import (
+    ProductionAdaptiveEngine,
+    MorphicTextNode,
+    FAISS_AVAILABLE,
+    SENTENCE_TRANSFORMERS_AVAILABLE,
+)
 
 # Initialize engine (singleton for demo; in prod use dependency injection or pool)
 engine = ProductionAdaptiveEngine(target_solution_text="General Reasoning", similarity_threshold=80.0)
@@ -30,10 +35,13 @@ app = FastAPI(
 )
 
 # Simple API Key Auth (header: X-API-Key)
-API_KEY = os.getenv("ENGINE_API_KEY", "demo-secret-key-123")
+API_KEY = os.environ.get("ENGINE_API_KEY")
+if not API_KEY:
+    raise RuntimeError("ENGINE_API_KEY environment variable is required — set it before starting the server.")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
 def verify_api_key(key: str = Depends(api_key_header)):
+    """FastAPI dependency: reject the request unless X-API-Key matches ENGINE_API_KEY."""
     if key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
     return key
@@ -69,6 +77,7 @@ class TeachRequest(BaseModel):
 # Endpoints
 @app.get("/", tags=["Health"])
 async def root():
+    """Basic service banner listing the engine's headline capabilities."""
     return {
         "message": "Self-Morphing Adaptive Recursion Engine API",
         "status": "running",
@@ -77,6 +86,7 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health():
+    """Liveness/readiness probe endpoint."""
     return {"status": "healthy", "engine_initialized": True}
 
 @app.post("/query", response_model=QueryResponse, tags=["Reasoning"])
@@ -251,26 +261,29 @@ async def list_pending_halts(api_key: str = Depends(verify_api_key)):
 @app.get("/system/info", tags=["System"])
 async def system_info(api_key: str = Depends(verify_api_key)):
     """Get comprehensive system capabilities and configuration."""
-    return {
-        "engine_version": "2.1.0",
-        "target": engine.raw_target,
-        "threshold": engine.threshold,
-        "features": {
-            "polymorphic_morphing": True,
-            "pog_planning": True,
-            "persistent_faiss": FAISS_AVAILABLE,
-            "sentence_transformers": SENTENCE_TRANSFORMERS_AVAILABLE,
-            "neo4j_support": True,
-            "gnn_propagation": True,
-            "self_teaching": True,
-            "fastapi_api": True
-        },
-        "persistence": {
-            "sqlite": True,
-            "faiss_persistent_index": True,
-            "neo4j_optional": True
+    try:
+        return {
+            "engine_version": "2.1.0",
+            "target": engine.raw_target,
+            "threshold": engine.threshold,
+            "features": {
+                "polymorphic_morphing": True,
+                "pog_planning": True,
+                "persistent_faiss": FAISS_AVAILABLE,
+                "sentence_transformers": SENTENCE_TRANSFORMERS_AVAILABLE,
+                "neo4j_support": True,
+                "gnn_propagation": True,
+                "self_teaching": True,
+                "fastapi_api": True
+            },
+            "persistence": {
+                "sqlite": True,
+                "faiss_persistent_index": True,
+                "neo4j_optional": True
+            }
         }
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/graph/visualize", tags=["Observability"])

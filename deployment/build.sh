@@ -2,6 +2,7 @@
 # Build script for Self-Morphing Adaptive Recursion Engine
 
 set -e
+cd "$(dirname "$0")"
 
 echo "🔨 Building Self-Morphing Adaptive Recursion Engine Docker image..."
 

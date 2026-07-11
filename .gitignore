@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.db
+*.bin
+.env
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+data/
+learning_report.json
+morphic_graph.dot

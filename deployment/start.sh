@@ -2,6 +2,7 @@
 # Start script for Self-Morphing Adaptive Recursion Engine (Docker Compose)
 
 set -e
+cd "$(dirname "$0")"
 
 echo "🚀 Starting Self-Morphing Adaptive Recursion Engine stack..."
 
