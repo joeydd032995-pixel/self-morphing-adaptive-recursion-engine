@@ -23,6 +23,7 @@ from organized_self_morphing_engine import (
 )
 
 def main():
+    """Parse CLI arguments, initialize the engine, and dispatch to the selected subcommand."""
     parser = argparse.ArgumentParser(description="Self-Morphing Adaptive Recursion Engine CLI")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 

@@ -10,6 +10,8 @@ services:
       - ENGINE_API_KEY=${ENGINE_API_KEY:?ENGINE_API_KEY must be set}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - ENGINE_DB_PATH=/app/state/engine_logs.db
+      - ENGINE_FAISS_INDEX_PATH=/app/state/faiss_index.bin
     volumes:
       - engine_persistence:/app/state
     restart: unless-stopped

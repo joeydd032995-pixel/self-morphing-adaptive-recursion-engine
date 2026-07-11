@@ -35,10 +35,13 @@ app = FastAPI(
 )
 
 # Simple API Key Auth (header: X-API-Key)
-API_KEY = os.environ["ENGINE_API_KEY"]  # required - no default; fail fast if unset
+API_KEY = os.environ.get("ENGINE_API_KEY")
+if not API_KEY:
+    raise RuntimeError("ENGINE_API_KEY environment variable is required — set it before starting the server.")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
 def verify_api_key(key: str = Depends(api_key_header)):
+    """FastAPI dependency: reject the request unless X-API-Key matches ENGINE_API_KEY."""
     if key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
     return key
@@ -74,6 +77,7 @@ class TeachRequest(BaseModel):
 # Endpoints
 @app.get("/", tags=["Health"])
 async def root():
+    """Basic service banner listing the engine's headline capabilities."""
     return {
         "message": "Self-Morphing Adaptive Recursion Engine API",
         "status": "running",
@@ -82,6 +86,7 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health():
+    """Liveness/readiness probe endpoint."""
     return {"status": "healthy", "engine_initialized": True}
 
 @app.post("/query", response_model=QueryResponse, tags=["Reasoning"])

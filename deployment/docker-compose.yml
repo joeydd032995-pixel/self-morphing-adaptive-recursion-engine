@@ -13,8 +13,11 @@ services:
       - NEO4J_USER=${NEO4J_USER:-neo4j}
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       - ENGINE_API_KEY=${ENGINE_API_KEY:?ENGINE_API_KEY must be set}
+      - ENGINE_DB_PATH=/app/state/engine_logs.db
+      - ENGINE_FAISS_INDEX_PATH=/app/state/faiss_index.bin
     depends_on:
-      - neo4j
+      neo4j:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
       - engine_persistence:/app/state  # Persist DB, FAISS index, reports, etc.
@@ -31,8 +34,13 @@ services:
       - "7687:7687"  # Bolt
     environment:
       - NEO4J_AUTH=neo4j/password
-      - NEO4J_dbms_memory_heap_initial__size=512m
-      - NEO4J_dbms_memory_heap_max__size=1g
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1g
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
