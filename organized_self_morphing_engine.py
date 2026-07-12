@@ -15,6 +15,8 @@ import os
 from functools import lru_cache
 from collections import defaultdict, Counter
 
+from semantic_cache import SemanticCache
+
 # Optional advanced dependencies (graceful fallback if not installed)
 try:
     import faiss
@@ -160,8 +162,9 @@ class ProductionAdaptiveEngine:
 
         # SQLite Database Layer for Persistence
         self.db_path = os.getenv("ENGINE_DB_PATH", "engine_logs.db")
+        self.semantic_cache = None  # (re)constructed by _init_db(), which tracks self.db_path
         self._init_db()
-        
+
         # Pre-process target string structure into absolute tokens
         self.target_tokens = self._tokenize_synonyms(self.raw_target)
         
@@ -297,6 +300,19 @@ class ProductionAdaptiveEngine:
         conn.close()
         print(f"✅ [DB] SQLite persistence initialized at {self.db_path} (advanced KG schema + RAG support enabled)")
 
+        # Semantic cache for expensive, side-effect-free calls (llm_call,
+        # semantic_retrieve_context). Rebuilt here (not just in __init__) so
+        # it always tracks the current self.db_path, including callers that
+        # reassign db_path and re-invoke _init_db() (e.g. test fixtures).
+        # Disable via ENGINE_SEMANTIC_CACHE_ENABLED for benchmarking/cache-free runs.
+        self.semantic_cache = None
+        if os.getenv("ENGINE_SEMANTIC_CACHE_ENABLED", "true").lower() not in ("false", "0", "no"):
+            self.semantic_cache = SemanticCache(
+                self.db_path,
+                ttl_seconds=int(os.getenv("ENGINE_SEMANTIC_CACHE_TTL_SECONDS", "3600")),
+                threshold=float(os.getenv("ENGINE_SEMANTIC_CACHE_THRESHOLD", "92.0")),
+            )
+
     @staticmethod
     def _add_column_if_missing(cursor, table, column, coltype):
         """Idempotently add a column to an existing table (SQLite has no ADD COLUMN IF NOT EXISTS)."""
@@ -327,6 +343,8 @@ class ProductionAdaptiveEngine:
         with self._lock:
             self.synonym_dictionary[cleaned_word] = cleaned_token
             self.calculate_similarity.cache_clear()
+            if self.semantic_cache is not None:
+                self.semantic_cache.invalidate("llm_call")
             # Persist to DB
             conn = sqlite3.connect(self.db_path)
             conn.execute('PRAGMA journal_mode=WAL')
@@ -345,6 +363,8 @@ class ProductionAdaptiveEngine:
             if cleaned_word in self.synonym_dictionary:
                 del self.synonym_dictionary[cleaned_word]
                 self.calculate_similarity.cache_clear()
+                if self.semantic_cache is not None:
+                    self.semantic_cache.invalidate("llm_call")
                 # Remove from DB
                 conn = sqlite3.connect(self.db_path)
                 conn.execute('PRAGMA journal_mode=WAL')
@@ -371,6 +391,8 @@ class ProductionAdaptiveEngine:
                 with self._lock:
                     self.synonym_dictionary[item["word"]] = item["suggested_token"]
                     self.calculate_similarity.cache_clear()
+                    if self.semantic_cache is not None:
+                        self.semantic_cache.invalidate("llm_call")
                     # Persist
                     conn = sqlite3.connect(self.db_path)
                     conn.execute('PRAGMA journal_mode=WAL')
@@ -1025,7 +1047,31 @@ class ProductionAdaptiveEngine:
             print(f"⚠️ Failed to load FAISS index: {e}")
         return False
 
-    def semantic_retrieve_context(self, query, k=5, use_faiss=True):
+    def semantic_retrieve_context(self, query, k=5, use_faiss=True, use_cache=True):
+        """Semantic-cached wrapper around _semantic_retrieve_context_uncached (see
+        that method for the actual FAISS/brute-force retrieval logic). A cache hit
+        — exact query+params match, or a near-duplicate query above the cache's
+        similarity threshold — returns the previously retrieved contexts without
+        re-running FAISS/brute-force search."""
+        cache = self.semantic_cache if use_cache else None
+        params = {"k": k, "use_faiss": use_faiss}
+        query_emb = None
+        if cache is not None:
+            query_emb = self.get_semantic_embedding(query)
+            if hasattr(query_emb, "cpu"):
+                query_emb = query_emb.cpu().numpy()
+            cached = cache.get("rag_retrieve", query, query_emb, params=params)
+            if cached is not None:
+                return cached
+
+        result = self._semantic_retrieve_context_uncached(query, k=k, use_faiss=use_faiss)
+
+        if cache is not None:
+            cache.put("rag_retrieve", query, query_emb, result, params=params)
+
+        return result
+
+    def _semantic_retrieve_context_uncached(self, query, k=5, use_faiss=True):
         """Semantic retrieval using persistent FAISS index (preferred) or brute-force fallback."""
         print(f"🔍 [RAG] Retrieving top-{k} contexts for query...")
 
@@ -1074,9 +1120,13 @@ class ProductionAdaptiveEngine:
         return [c for s, c in scored[:k]]
 
     def update_faiss_after_ingest(self):
-        """Rebuild FAISS index after new documents are ingested."""
+        """Rebuild FAISS index after new documents are ingested, and invalidate
+        cached retrieval results so newly-ingested content is discoverable
+        rather than masked by a stale cached response."""
         if FAISS_AVAILABLE:
             self.build_faiss_index(force_rebuild=True)
+        if self.semantic_cache is not None:
+            self.semantic_cache.invalidate("rag_retrieve")
 
     # --- ADVANCED RETRIEVAL: query rewriting, cross-encoder re-ranking, agentic multi-hop ---
     def _rewrite_query(self, query):
@@ -1208,6 +1258,8 @@ class ProductionAdaptiveEngine:
                             with self._lock:
                                 self.synonym_dictionary[iw] = target_token
                                 self.calculate_similarity.cache_clear()
+                                if self.semantic_cache is not None:
+                                    self.semantic_cache.invalidate("llm_call")
                                 # Persist to DB
                                 conn = sqlite3.connect(self.db_path)
                                 conn.execute('PRAGMA journal_mode=WAL')
@@ -1408,7 +1460,34 @@ class ProductionAdaptiveEngine:
     # =====================================================================
     # LLM INTEGRATION MIXIN / METHODS (Hybrid Extension)
     # =====================================================================
-    def llm_call(self, prompt, max_tokens=150, temperature=0.7, json_mode=False, max_retries=3):
+    def llm_call(self, prompt, max_tokens=150, temperature=0.7, json_mode=False, max_retries=3, use_cache=True):
+        """Semantic-cached wrapper around _llm_call_uncached (see that method for
+        the actual OpenAI/Groq/mock LLM integration logic). A cache hit — exact
+        prompt+params match, or a near-duplicate prompt scoring above the cache's
+        similarity threshold — returns the previously computed response without
+        calling the LLM (or the mock) again. use_cache=False bypasses the cache
+        entirely, e.g. for callers that need a fresh/independent draw."""
+        cache = self.semantic_cache if use_cache else None
+        params = {"max_tokens": max_tokens, "temperature": temperature, "json_mode": json_mode}
+        emb = None
+        if cache is not None:
+            emb = self.get_semantic_embedding(prompt)
+            if hasattr(emb, "cpu"):
+                emb = emb.cpu().numpy()
+            cached = cache.get("llm_call", prompt, emb, params=params)
+            if cached is not None:
+                return cached
+
+        result = self._llm_call_uncached(
+            prompt, max_tokens=max_tokens, temperature=temperature,
+            json_mode=json_mode, max_retries=max_retries)
+
+        if cache is not None:
+            cache.put("llm_call", prompt, emb, result, params=params)
+
+        return result
+
+    def _llm_call_uncached(self, prompt, max_tokens=150, temperature=0.7, json_mode=False, max_retries=3):
         """
         Enhanced LLM integration with retries, error handling, and env-based client.
         Supports OpenAI and Groq via environment variables.
@@ -1416,7 +1495,7 @@ class ProductionAdaptiveEngine:
         """
         import os
         import time
-        
+
         api_key = os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")
         is_groq = bool(os.getenv("GROQ_API_KEY"))
         
@@ -1620,6 +1699,8 @@ class ProductionAdaptiveEngine:
                     with self._lock:
                         self.synonym_dictionary[word] = token
                         self.calculate_similarity.cache_clear()
+                        if self.semantic_cache is not None:
+                            self.semantic_cache.invalidate("llm_call")
                         # Persist
                         conn = sqlite3.connect(self.db_path)
                         cursor = conn.cursor()

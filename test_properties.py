@@ -28,6 +28,7 @@ hypothesis = pytest.importorskip("hypothesis")
 from hypothesis import given, settings, strategies as st, HealthCheck
 
 from organized_self_morphing_engine import ProductionAdaptiveEngine, MorphicTextNode
+from semantic_cache import SemanticCache
 
 
 @pytest.fixture(scope="module")
@@ -250,6 +251,75 @@ class TestPoGHopInvariants:
             # No expired or superseded relation is ever selected.
             assert not (selected_pairs & expired)
             assert not (selected_pairs & superseded)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestSemanticCacheInvariants:
+    """Hypothesis: SemanticCache's threshold / exact-hash / invalidate guarantees."""
+
+    @settings(max_examples=40, deadline=None,
+              suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(
+        query_text=word_strategy,
+        response_value=st.one_of(st.text(max_size=50), st.integers(), st.booleans()),
+        threshold=st.floats(min_value=0.0, max_value=100.0, allow_nan=False, allow_infinity=False),
+        query_vec=st.lists(st.floats(min_value=-1.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+                            min_size=2, max_size=6),
+        cand_vec=st.lists(st.floats(min_value=-1.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+                           min_size=2, max_size=6),
+    )
+    def test_never_returns_below_threshold_similarity(self, query_text, response_value, threshold,
+                                                        query_vec, cand_vec):
+        from hypothesis import assume
+        assume(len(query_vec) == len(cand_vec))
+        import numpy as np
+        tmp = tempfile.mkdtemp()
+        try:
+            cache = SemanticCache(os.path.join(tmp, "c.db"), threshold=threshold)
+            # Stored under different text than the lookup, so any hit must come
+            # from the cosine-similarity scan, not the exact-hash fast path.
+            cache.put("kind", "different text than query", cand_vec, response_value)
+            result = cache.get("kind", query_text, query_vec)
+            if result is not None:
+                qv = np.asarray(query_vec, dtype=np.float32)
+                cv = np.asarray(cand_vec, dtype=np.float32)
+                qn, cn = float(np.linalg.norm(qv)), float(np.linalg.norm(cv))
+                score = 100.0 * float(np.dot(qv, cv) / (qn * cn))
+                assert score >= threshold - 1e-4
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @settings(max_examples=40, deadline=None,
+              suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(
+        query_text=word_strategy,
+        response_value=st.one_of(st.text(max_size=50), st.integers(), st.booleans()),
+        threshold=st.floats(min_value=0.0, max_value=100.0, allow_nan=False, allow_infinity=False),
+    )
+    def test_exact_text_always_hits_regardless_of_embedding(self, query_text, response_value, threshold):
+        tmp = tempfile.mkdtemp()
+        try:
+            cache = SemanticCache(os.path.join(tmp, "c.db"), threshold=threshold)
+            cache.put("kind", query_text, [1.0, 0.0], response_value)
+            # Even with a wildly different / mismatched-shape embedding on lookup,
+            # identical query_text must still hit via the exact-hash fast path.
+            result = cache.get("kind", query_text, [0.0, 1.0, 0.0, -1.0])
+            assert result == response_value
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @settings(max_examples=40, deadline=None,
+              suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(query_text=word_strategy, response_value=st.text(max_size=50))
+    def test_invalidate_clears_subsequent_hits(self, query_text, response_value):
+        tmp = tempfile.mkdtemp()
+        try:
+            cache = SemanticCache(os.path.join(tmp, "c.db"))
+            cache.put("kind", query_text, [1.0, 0.0], response_value)
+            assert cache.get("kind", query_text, [1.0, 0.0]) == response_value
+            cache.invalidate("kind")
+            assert cache.get("kind", query_text, [1.0, 0.0]) is None
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
