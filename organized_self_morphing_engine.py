@@ -8,6 +8,7 @@ import hashlib
 import functools
 import threading
 import random  # For mock LLM simulation
+import uuid
 import numpy as np
 import torch
 import os
@@ -151,7 +152,12 @@ class ProductionAdaptiveEngine:
         self.admin_review_queue = {}
         self.qa_audit_log = []
         self.explosion_log = []
-        
+
+        # PoG grounding-score early-stopping threshold (0-100): a hop whose
+        # grounding score meets this bar ends exploration early instead of
+        # always spending max_hops.
+        self.grounding_threshold = float(os.getenv("ENGINE_POG_GROUNDING_THRESHOLD", "75.0"))
+
         # SQLite Database Layer for Persistence
         self.db_path = os.getenv("ENGINE_DB_PATH", "engine_logs.db")
         self._init_db()
@@ -348,9 +354,17 @@ class ProductionAdaptiveEngine:
                 conn.close()
 
     def admin_resolve_halt(self, task_id, approve=True):
-        """Human Admin intervention gateway to unblock a specifically suspended execution thread."""
+        """Human Admin intervention gateway to unblock a specifically suspended execution thread.
+        Queue entries come in two kinds: the trampoline's synonym-learning halts
+        (no explicit "kind", carry "word"/"suggested_token") and PoG's non-blocking
+        "pog_ungrounded" annotations (carry "query"/"confidence" instead) — only the
+        former learns a synonym mapping on approval; the latter just updates status."""
         if task_id in self.admin_review_queue:
             item = self.admin_review_queue[task_id]
+            if item.get("kind") == "pog_ungrounded":
+                item["status"] = "APPROVED" if approve else "REJECTED"
+                print(f"🛠️ [Admin Interface] {'Approved' if approve else 'Rejected'} PoG review Task [{task_id}].")
+                return
             if approve:
                 item["status"] = "APPROVED"
                 # Lock vocabulary translation rule to the production engine dictionary
@@ -1999,88 +2013,186 @@ class ProductionAdaptiveEngine:
         print("📋 [Report] Learning efficacy report generated: learning_report.json")
         return report
 
-    def pog_plan_and_reason(self, query, max_hops=3, use_kg=True):
-        """
-        Dedicated PoG (Plan-on-Graph) style adaptive planning method.
-        Orchestrates:
-        - Task decomposition into sub-objectives (via LLM JSON mode)
-        - Adaptive KG exploration / multi-hop path finding (using kg_relations + confidence)
-        - Memory update (audit logs + in-memory context)
-        - Reflection & self-correction (symbolic_verifier + self_auditor_verify)
-        Easy extension of self_teaching_loop + advanced KG schema.
-        Returns structured plan + final reasoned answer with confidence.
-        """
-        print(f"🧭 [PoG] Starting adaptive planning for: '{query[:80]}...' (max_hops={max_hops})")
-        
+    def _kg_frontier_step(self, cursor, frontier_ids, as_of_iso, limit=5):
+        """Rank candidate relations expanding out from the current traversal
+        frontier — real hop-to-hop movement, not a re-query of the same global
+        top-5 every time. Bitemporal: only 'current belief' rows (tx_end IS
+        NULL) valid at as_of_iso are considered. If frontier_ids is empty (no
+        entities recognized in the query), falls back to a global
+        top-N-by-confidence scan so the no-entity-recognized UX is unchanged.
+        Pure given a cursor — unit-testable in isolation."""
+        where_clauses = [
+            "tx_end IS NULL",
+            "(valid_from IS NULL OR valid_from <= ?)",
+            "(valid_to IS NULL OR valid_to >= ?)",
+        ]
+        params = [as_of_iso, as_of_iso]
+        if frontier_ids:
+            placeholders = ",".join("?" for _ in frontier_ids)
+            where_clauses.insert(0, f"source_id IN ({placeholders})")
+            params = list(frontier_ids) + params
+        query = (
+            "SELECT source_id, target_id, relation_type, confidence, valid_from, valid_to "
+            "FROM kg_relations WHERE " + " AND ".join(where_clauses) +
+            " ORDER BY confidence DESC LIMIT ?"
+        )
+        params.append(limit)
+        cursor.execute(query, params)
+        return cursor.fetchall()
+
+    def _hop_grounding_score(self, hop_relation_desc, query_or_subobjective, db_confidence):
+        """Grounding score (0-100) for a single hop: how well-supported the
+        relation is in the KG (db_confidence) blended with how semantically
+        relevant it is to the query (semantic_match_score), 50/50."""
+        db_component = min(100.0, max(0.0, (db_confidence or 0.0) * 100.0))
+        semantic_component = self.semantic_match_score(hop_relation_desc, query_or_subobjective)
+        return min(100.0, max(0.0, 0.5 * db_component + 0.5 * semantic_component))
+
+    def _flag_ungrounded_pog(self, query, task_id, confidence):
+        """Non-blocking annotation: record an ungrounded/low-confidence PoG
+        result in admin_review_queue for visibility via /admin/halts and
+        /admin/resolve, without pausing execution (unlike the trampoline's
+        blocking PENDING_HALT pattern used for synonym-learning halts)."""
+        with self._lock:
+            self.admin_review_queue[task_id] = {
+                "kind": "pog_ungrounded",
+                "query": query,
+                "confidence": confidence,
+                "status": "PENDING_REVIEW",
+            }
+        print(f"⚠️ [PoG] Task [{task_id}] ungrounded (conf {confidence:.1f}%) — flagged for admin review (non-blocking).")
+
+    def _pog_hop_generator(self, query, max_hops, as_of, task_id):
+        """Generator form of PoG's adaptive KG exploration: yields one event
+        per hop as it happens, then a final 'done' event carrying the same
+        shape pog_plan_and_reason has always returned (plus additive task_id/
+        stop_reason). Real hop-to-hop traversal — each hop's frontier is the
+        previous hop's chosen target, not a re-query of the same global top-5
+        — replaces the old fixed-max_hops loop, combined with bitemporal
+        time-scoping and grounding-score-based early exit. self._lock is held
+        only around each bounded per-hop DB query, not across the generator's
+        full lifetime, so it doesn't serialize unrelated engine work beyond
+        that brief window."""
+        effective_as_of = as_of or datetime.datetime.now().isoformat()
+
         # 1. Decomposition (Guidance)
         decomp_prompt = f"Decompose this query into 2-4 clear sub-objectives for KG reasoning: {query}. Return JSON list of strings."
         decomp_response = self.llm_call(decomp_prompt, json_mode=True)
-        
+
         sub_objectives = []
         if isinstance(decomp_response, dict) and "sub_objectives" in decomp_response:
             sub_objectives = decomp_response["sub_objectives"]
         else:
             # Fallback simple decomposition
             sub_objectives = [f"Understand {query}", f"Find related entities in KG", f"Verify solution path"]
-        
+
         print(f"   Decomposed into {len(sub_objectives)} sub-objectives: {sub_objectives[:2]}...")
-        
-        # 2. Adaptive Exploration + Memory (KG multi-hop simulation using schema)
+        yield {"type": "decomposition", "task_id": task_id, "sub_objectives": sub_objectives}
+
+        # 2. Real hop-to-hop traversal with bitemporal scoping + grounding-based early exit
         memory = {"query": query, "hops": [], "confidence": 0.0}
         current_conf = 50.0
-        
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            for hop in range(max_hops):
-                # Simulate / query KG relations (in real: Cypher or SQL join on kg_relations)
+        stop_reason = "max_hops"
+        frontier = [e.lower().replace(" ", "_") for e in self._extract_entities(query)]
+
+        for hop in range(max_hops):
+            with self._lock:
+                conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT source_id, target_id, relation_type, confidence 
-                    FROM kg_relations 
-                    ORDER BY confidence DESC LIMIT 5
-                ''')
-                kg_paths = cursor.fetchall()
-                
-                if kg_paths:
-                    best_path = kg_paths[0]
-                    memory["hops"].append({
-                        "hop": hop + 1,
-                        "path": f"{best_path[0]} --{best_path[2]}--> {best_path[1]}",
-                        "conf": best_path[3]
-                    })
-                    current_conf = max(current_conf, (best_path[3] or 0.5) * 100)
-                    print(f"   Hop {hop+1}: Explored {best_path[2]} relation (conf {best_path[3]:.2f})")
-                else:
-                    print(f"   Hop {hop+1}: No strong KG relations found (using RAG fallback)")
-                    break
-            
-            conn.close()
-        
+                candidates = self._kg_frontier_step(cursor, frontier, effective_as_of, limit=5)
+                conn.close()
+
+            if not candidates:
+                print(f"   Hop {hop+1}: No strong KG relations found (using RAG fallback)")
+                stop_reason = "kg_exhausted"
+                break
+
+            source_id, target_id, relation_type, confidence, valid_from, valid_to = candidates[0]
+            path_desc = f"{source_id} --{relation_type}--> {target_id}"
+            grounding = self._hop_grounding_score(path_desc, query, confidence)
+            hop_event = {"hop": hop + 1, "path": path_desc, "conf": confidence, "grounding": grounding}
+            memory["hops"].append(hop_event)
+            current_conf = max(current_conf, grounding)
+            print(f"   Hop {hop+1}: Explored {relation_type} relation (conf {(confidence or 0):.2f}, grounding {grounding:.1f})")
+            yield {"type": "hop", "task_id": task_id, **hop_event}
+
+            # Advance the frontier to the chosen target (real hop-to-hop
+            # traversal — fixes the pre-Phase-8 bug where every hop re-queried
+            # the same global top-5 relations regardless of prior hops).
+            frontier = [target_id]
+
+            if grounding >= self.grounding_threshold:
+                stop_reason = "grounded"
+                break
+
         memory["confidence"] = current_conf
-        
-        # 3. Reflection & Self-Correction
+
+        # 3. Reflection & Self-Correction (logic unchanged from pre-Phase-8 behavior;
+        # coerced to bool() below — self_auditor_verify returns the proposal string
+        # or None rather than True/False, so the bare `and` chain could previously
+        # produce verified=None, which crashes PoGResponse's `verified: bool` field
+        # over REST whenever verification is rejected).
         reflection_prompt = f"Reflect on this partial plan for '{query}': {memory}. Suggest corrections or next steps. JSON: {{'reflection': str, 'next_action': str, 'final_confidence': float}}"
         reflection = self.llm_call(reflection_prompt, json_mode=True)
-        
+
         verified = False
         final_conf = current_conf
         if isinstance(reflection, dict):
             final_conf = reflection.get("final_confidence", current_conf)
-            verified = self.symbolic_verifier(str(reflection), query) and self.self_auditor_verify(str(reflection), query)
+            verified = bool(self.symbolic_verifier(str(reflection), query) and self.self_auditor_verify(str(reflection), query))
+
+        yield {"type": "reflection", "task_id": task_id, "verified": verified, "confidence": final_conf}
 
         if verified and final_conf > 70:
             result = f"✅ PoG Plan Complete: {sub_objectives[0]} → {memory['hops'][-1]['path'] if memory['hops'] else 'direct'} (conf {final_conf:.1f}%)"
         else:
             result = f"⚠️ PoG Partial: Needs more hops or admin review. Current conf {current_conf:.1f}%"
-        
+            if stop_reason in ("kg_exhausted", "max_hops"):
+                self._flag_ungrounded_pog(query, task_id, final_conf)
+
         print(f"   Reflection: {'Verified' if verified else 'Needs review'}")
-        return {
+        yield {
+            "type": "done",
+            "task_id": task_id,
+            "stop_reason": stop_reason,
             "query": query,
             "sub_objectives": sub_objectives,
             "memory": memory,
             "result": result,
-            "confidence": final_conf if 'final_conf' in locals() else current_conf,
-            "verified": verified
+            "confidence": final_conf,
+            "verified": verified,
+        }
+
+    def pog_plan_and_reason(self, query, max_hops=3, use_kg=True, as_of=None, task_id=None):
+        """
+        Dedicated PoG (Plan-on-Graph) style adaptive planning method.
+        Orchestrates:
+        - Task decomposition into sub-objectives (via LLM JSON mode)
+        - Real hop-to-hop KG exploration (using kg_relations + bitemporal scoping)
+          with a grounding-score-based early-stopping condition
+        - Memory update (audit logs + in-memory context)
+        - Reflection & self-correction (symbolic_verifier + self_auditor_verify)
+        as_of (optional ISO8601 string) time-scopes the traversal to facts valid
+        at that moment; defaults to now. task_id is generated if not supplied.
+        A thin synchronous wrapper around _pog_hop_generator, which callers that
+        want live per-hop visibility (e.g. a WebSocket stream) can consume directly.
+        Returns structured plan + final reasoned answer with confidence.
+        """
+        print(f"🧭 [PoG] Starting adaptive planning for: '{query[:80]}...' (max_hops={max_hops})")
+        task_id = task_id or str(uuid.uuid4())[:8]
+        done_event = None
+        for event in self._pog_hop_generator(query, max_hops, as_of, task_id):
+            if event.get("type") == "done":
+                done_event = event
+        return {
+            "query": done_event["query"],
+            "sub_objectives": done_event["sub_objectives"],
+            "memory": done_event["memory"],
+            "result": done_event["result"],
+            "confidence": done_event["confidence"],
+            "verified": done_event["verified"],
+            "task_id": done_event["task_id"],
+            "stop_reason": done_event["stop_reason"],
         }
 
     def attach_node(self, parent_node, new_node, branch_type="next_linear"):

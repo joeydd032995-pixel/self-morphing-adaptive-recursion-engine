@@ -20,6 +20,8 @@ import json
 import sqlite3
 import tempfile
 import shutil
+import time
+import datetime
 import torch
 from unittest.mock import MagicMock
 
@@ -97,7 +99,7 @@ class TestVerificationLayers:
 
 class TestPoGPlanning:
     """Test the new dedicated PoG method."""
-    
+
     def test_pog_basic(self, engine):
         result = engine.pog_plan_and_reason("How to optimize data pipelines?", max_hops=2)
         assert isinstance(result, dict)
@@ -105,6 +107,120 @@ class TestPoGPlanning:
         assert "result" in result
         assert result["confidence"] > 0
         assert "PoG" in result["result"] or "Plan" in result["result"]
+
+    def test_pog_verified_is_always_a_real_bool(self, engine):
+        # self_auditor_verify returns the proposal string or None (not True/False),
+        # so `symbolic_verifier(...) and self_auditor_verify(...)` alone can yield
+        # None instead of False — which crashes PoGResponse's `verified: bool`
+        # field over REST. Run enough times to hit both the rejected and the
+        # accepted branch of the mock LLM's randomized verification outcome.
+        for _ in range(15):
+            result = engine.pog_plan_and_reason("How to optimize data pipelines?", max_hops=2)
+            assert isinstance(result["verified"], bool)
+
+    def test_pog_real_hop_traversal(self, engine):
+        # Disable grounding early-exit so all three chained hops actually run —
+        # this is the regression proof that hops now traverse hop-to-hop
+        # (source = previous hop's target) instead of re-querying the same
+        # global top-5 kg_relations every iteration.
+        engine.grounding_threshold = 101.0
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        for src, tgt in [("alpha", "beta"), ("beta", "gamma"), ("gamma", "delta")]:
+            engine.kg_assert_relation(cursor, src, tgt, "leads_to", 0.9)
+        conn.commit()
+        conn.close()
+
+        result = engine.pog_plan_and_reason("Tell me about Alpha", max_hops=3)
+        hops = result["memory"]["hops"]
+        assert [h["path"] for h in hops] == [
+            "alpha --leads_to--> beta",
+            "beta --leads_to--> gamma",
+            "gamma --leads_to--> delta",
+        ]
+
+    def test_pog_grounding_early_exit(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        # High confidence + a query that closely matches the relation text
+        # (topic/resolves/answer all appear verbatim) => a high grounding
+        # score that should trigger early exit well before max_hops.
+        engine.kg_assert_relation(cursor, "topic", "answer", "resolves", 1.0)
+        conn.commit()
+        conn.close()
+
+        result = engine.pog_plan_and_reason("topic resolves answer", max_hops=5)
+        assert len(result["memory"]["hops"]) < 5
+        assert result["stop_reason"] == "grounded"
+
+    def test_pog_bitemporal_scoping(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        # Expired valid-time window -> excluded when as_of is "now".
+        engine.kg_assert_relation(cursor, "old_fact", "old_target", "was_true", 0.9,
+                                   valid_from="2000-01-01T00:00:00", valid_to="2001-01-01T00:00:00")
+        conn.commit()
+        conn.close()
+
+        now_iso = datetime.datetime.now().isoformat()
+        result = engine.pog_plan_and_reason("old fact query", max_hops=3, as_of=now_iso)
+        assert result["memory"]["hops"] == []
+        assert result["stop_reason"] == "kg_exhausted"
+
+        # A superseded relation (tx_end set) must be excluded regardless of as_of,
+        # even when it's still within its nominal valid-time window.
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        engine.kg_assert_relation(cursor, "a2", "b2", "still_valid", 0.9, valid_from="1999-01-01T00:00:00")
+        conn.commit()
+        conn.close()
+        engine.kg_supersede_relation("a2", "b2", "still_valid")
+
+        result2 = engine.pog_plan_and_reason("a2 query", max_hops=3, as_of=None)
+        assert result2["memory"]["hops"] == []
+        assert result2["stop_reason"] == "kg_exhausted"
+
+    def test_pog_ungrounded_routes_to_review_queue_nonblocking(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        # Low confidence + a relation with no semantic relevance to the query
+        # keeps the grounding score (and therefore current_conf/final_conf,
+        # since the mock LLM never returns a "final_confidence" override key)
+        # well under the >70 success bar regardless of the mock's randomized
+        # verification text.
+        engine.kg_assert_relation(cursor, "zzz_irrelevant_a", "zzz_irrelevant_b", "weird_rel", 0.05)
+        conn.commit()
+        conn.close()
+
+        start = time.time()
+        result = engine.pog_plan_and_reason("Completely unrelated topic about cooking recipes", max_hops=3)
+        elapsed = time.time() - start
+
+        assert result["stop_reason"] in ("kg_exhausted", "max_hops")
+        assert result["confidence"] <= 70
+        assert result["task_id"] in engine.admin_review_queue
+        assert engine.admin_review_queue[result["task_id"]]["kind"] == "pog_ungrounded"
+        assert elapsed < 5  # non-blocking: must not busy-poll/wait for admin resolution
+
+    def test_pog_generator_matches_wrapper(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        engine.kg_assert_relation(cursor, "x_node", "y_node", "weak_rel", 0.05)
+        conn.commit()
+        conn.close()
+
+        query = "Completely unrelated query text here"
+        task_id = "fixed-task-id-for-parity-check"
+
+        events = list(engine._pog_hop_generator(query, 3, None, task_id))
+        done = next(e for e in events if e["type"] == "done")
+        wrapper_result = engine.pog_plan_and_reason(query, max_hops=3, task_id=task_id)
+
+        assert done["query"] == wrapper_result["query"] == query
+        assert done["result"] == wrapper_result["result"]
+        assert done["confidence"] == wrapper_result["confidence"]
+        assert done["stop_reason"] == wrapper_result["stop_reason"]
+        assert done["task_id"] == wrapper_result["task_id"] == task_id
 
 
 class TestSelfTeachingAndDynamicNodes:
