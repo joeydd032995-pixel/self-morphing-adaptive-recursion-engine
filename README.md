@@ -281,6 +281,8 @@ All configuration is environment-variable driven (nothing hardcoded that matters
 
 Constructor knobs: `similarity_threshold` (resolved-match cutoff), and internal `flag_buffer` (low-confidence zone width).
 
+See [`.env.example`](.env.example) for a copy-pasteable template of all variables above.
+
 ## FastAPI Server & CLI
 
 ### FastAPI (`fastapi_server.py`)
@@ -372,10 +374,13 @@ A `StatefulSet` with a `PersistentVolumeClaim` mounted at `/app/state` (where th
 
 ## Design Notes & Limitations
 
+- **v0.1 alpha**: this is an early, actively-developed release — expect API and behavior changes between minor versions. Treat it as an experimental neurosymbolic prototype, not a verified production-ready cognitive architecture.
 - **LLM dependence**: generative steps (proposals, PoG decomposition, query rewriting, agentic hops) use a real LLM when `OPENAI_API_KEY`/`GROQ_API_KEY` are set, otherwise a deterministic mock — sufficient for demos and tests but not for production reasoning quality.
 - **In-memory graph**: `MorphicTextNode` graphs are in-memory per request; durable state lives in the DB/KG, not as a serialized graph.
 - **Single-node vector search**: the file-based FAISS index suits single-node or small clusters; scale out with an external vector DB.
-- **Security**: API-key auth + optional rate limiting are provided; add input sanitization and sandboxing before exposing LLM-generated content externally.
+- **Security**: API-key auth + optional rate limiting cover the HTTP surface. LLM-generated content that reaches the knowledge graph is already gated by `symbolic_verifier`/`self_auditor_verify` before any write (see `attach_node`, `self_teaching_loop` in `organized_self_morphing_engine.py`) — no raw LLM output is written to the graph unchecked.
+- **CI**: GitHub Actions runs the full `pytest` + Hypothesis suite on every push/PR.
+- **Packaging**: pip-installable via `pyproject.toml` — `pip install -e .` or `pip install -e ".[all]"` for every optional feature. The flat-module layout (no `src/`) is intentional for this project's current size.
 
 ## Roadmap
 

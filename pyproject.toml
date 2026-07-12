@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "self-morphing-adaptive-recursion-engine"
+version = "0.1.0"
+description = "A hybrid morphing + RAG + knowledge-graph + GNN self-teaching neurosymbolic engine (v0.1 alpha)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "joeydd032995-pixel" }]
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "numpy",
+    "networkx",
+    "fastapi",
+    "uvicorn",
+    "requests",
+]
+
+[project.optional-dependencies]
+llm = ["openai", "groq"]
+gnn = ["torch-geometric"]
+neo4j = ["neo4j"]
+faiss = ["faiss-cpu", "sentence-transformers"]
+observability = ["prometheus-client", "slowapi"]
+test = ["pytest", "hypothesis"]
+all = [
+    "self-morphing-adaptive-recursion-engine[llm,gnn,neo4j,faiss,observability]",
+]
+
+[project.scripts]
+morphic = "cli:main"
+
+[tool.setuptools]
+py-modules = ["organized_self_morphing_engine", "fastapi_server", "cli"]
