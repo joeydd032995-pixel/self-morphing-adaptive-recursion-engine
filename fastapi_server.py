@@ -16,9 +16,12 @@ import time
 import uuid
 import logging
 import sqlite3
+import asyncio
+import threading
+import queue as thread_queue
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.security import APIKeyHeader
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
@@ -94,6 +97,43 @@ async def lifespan(app: FastAPI):
 def _rate_limit_key(request: Request) -> str:
     """Rate-limit bucket: per API key when present, else per client address."""
     return request.headers.get("X-API-Key") or get_remote_address(request)
+
+
+def _parse_rate_limit(spec: str) -> int:
+    """Parse a slowapi-style '120/minute' spec into a per-minute integer,
+    defaulting to 120 on any unexpected format."""
+    try:
+        return int(spec.split("/")[0])
+    except (ValueError, IndexError):
+        return 120
+
+
+class _TokenBucket:
+    """Simple in-process per-key token bucket. slowapi's HTTP middleware
+    doesn't cover WebSocket connections, so /ws/pog/plan is rate-limited
+    manually here — independent of slowapi, not a reuse of it. Not
+    distributed; fine for the single-process deployment this engine
+    currently targets."""
+
+    def __init__(self, rate_per_minute: int, capacity: Optional[int] = None):
+        self.rate_per_minute = rate_per_minute
+        self.capacity = capacity or rate_per_minute
+        self._buckets: Dict[str, tuple] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        with self._lock:
+            tokens, last = self._buckets.get(key, (float(self.capacity), now))
+            tokens = min(self.capacity, tokens + (now - last) * (self.rate_per_minute / 60.0))
+            if tokens < 1:
+                self._buckets[key] = (tokens, now)
+                return False
+            self._buckets[key] = (tokens - 1, now)
+            return True
+
+
+ws_rate_limiter = _TokenBucket(rate_per_minute=_parse_rate_limit(os.getenv("RATE_LIMIT", "120/minute")))
 
 
 app = FastAPI(
@@ -235,6 +275,84 @@ async def pog_plan(request: QueryRequest, api_key: str = Depends(verify_api_key)
     except Exception as e:
         logger.exception("pog_plan failed")
         raise HTTPException(status_code=500, detail="Internal server error") from e
+
+@app.websocket("/ws/pog/plan")
+async def pog_plan_ws(websocket: WebSocket, eng: ProductionAdaptiveEngine = Depends(get_engine)):
+    """Real-time PoG visibility: streams one JSON event per hop as PoG explores
+    the knowledge graph (mirroring _pog_hop_generator's 'hop'/'reflection'
+    events), then a final 'done' event with the same result shape POST
+    /pog/plan returns. This endpoint is purely additive — /pog/plan is
+    unchanged and still fully drains the generator internally.
+
+    Auth is folded into the first JSON message ({"api_key": ..., "query": ...,
+    "max_hops": ..., "as_of": ...}) rather than a query-string key, since a
+    key in the URL would leak into access/proxy logs and browser history;
+    WebSocket handshakes can't carry a custom X-API-Key header the way plain
+    HTTP requests do. Close codes: 4400 malformed/missing first message or
+    query, 4401 bad api_key, 4429 rate-limited.
+    """
+    await websocket.accept()
+
+    try:
+        first_message = await websocket.receive_json()
+    except Exception:
+        await websocket.close(code=4400)
+        return
+    if not isinstance(first_message, dict):
+        await websocket.close(code=4400)
+        return
+
+    if first_message.get("api_key") != API_KEY:
+        await websocket.close(code=4401)
+        return
+
+    if not ws_rate_limiter.allow(first_message.get("api_key")):
+        await websocket.close(code=4429)
+        return
+
+    query = first_message.get("query")
+    if not query or not isinstance(query, str):
+        await websocket.close(code=4400)
+        return
+    try:
+        max_hops = int(first_message.get("max_hops", 3))
+    except (TypeError, ValueError):
+        max_hops = 3
+    as_of = first_message.get("as_of")
+    task_id = str(uuid.uuid4())[:8]
+
+    q: "thread_queue.Queue" = thread_queue.Queue()
+
+    def _produce():
+        """Runs in a worker thread (via run_in_executor): drains the sync
+        generator and relays each event onto the thread-safe queue. A plain
+        queue.Queue is used (not asyncio.Queue) because it's the only safe
+        way to hand events from a worker thread to the event loop's task."""
+        try:
+            for event in eng._pog_hop_generator(query, max_hops, as_of, task_id):
+                q.put(event)
+        except Exception as e:
+            logger.exception("pog_plan_ws generator failed")
+            q.put({"type": "error", "task_id": task_id, "detail": str(e)})
+        finally:
+            q.put(None)  # sentinel
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _produce)
+
+    try:
+        while True:
+            event = await asyncio.to_thread(q.get)
+            if event is None:
+                break
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        return
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 @app.post("/rag/ingest", tags=["RAG"])
 async def rag_ingest(request: IngestRequest, api_key: str = Depends(verify_api_key),
