@@ -169,5 +169,90 @@ class TestTrampolineTermination:
         assert result is None or isinstance(result, (str, dict))
 
 
+class TestPoGHopInvariants:
+    """Hypothesis: PoG's redesigned hop loop (real frontier-to-frontier
+    traversal + bitemporal scoping + grounding-score-based early exit)."""
+
+    @settings(max_examples=25, deadline=None,
+              suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(
+        n=st.integers(min_value=1, max_value=8),
+        seed=st.integers(min_value=0, max_value=10_000),
+        max_hops=st.integers(min_value=1, max_value=6),
+        grounding_threshold=st.floats(min_value=0.0, max_value=100.0, allow_nan=False, allow_infinity=False),
+    )
+    def test_hop_chain_bounds_and_invariants(self, n, seed, max_hops, grounding_threshold):
+        import random
+        import datetime
+        import sqlite3
+        rng = random.Random(seed)
+
+        tmp = tempfile.mkdtemp()
+        try:
+            eng = ProductionAdaptiveEngine("compute analytics", similarity_threshold=75.0)
+            eng.db_path = os.path.join(tmp, "pog_prop.db")
+            eng._init_db()
+            eng.grounding_threshold = grounding_threshold
+
+            # Random chain n0 -> n1 -> ... -> n{n-1}; each relation randomly
+            # confident and randomly time-scoped, so some are expired or
+            # superseded and must never be selectable regardless of confidence.
+            now = datetime.datetime.now()
+            node_ids = [f"n{i}" for i in range(n)]
+            expired, superseded = set(), set()
+            conn = sqlite3.connect(eng.db_path)
+            cursor = conn.cursor()
+            to_supersede = []
+            for i in range(n - 1):
+                src, tgt = node_ids[i], node_ids[i + 1]
+                confidence = rng.random()
+                choice = rng.random()
+                valid_from = valid_to = None
+                if choice < 0.2:
+                    valid_from = (now - datetime.timedelta(days=10)).isoformat()
+                    valid_to = (now - datetime.timedelta(days=5)).isoformat()
+                    expired.add((src, tgt))
+                eng.kg_assert_relation(cursor, src, tgt, "next", confidence,
+                                        valid_from=valid_from, valid_to=valid_to)
+                if 0.2 <= choice < 0.35:
+                    superseded.add((src, tgt))
+                    to_supersede.append((src, tgt))
+            conn.commit()
+            conn.close()
+            for src, tgt in to_supersede:
+                eng.kg_supersede_relation(src, tgt, "next")
+
+            task_id = f"prop-{seed}-{n}-{max_hops}"
+            events = list(eng._pog_hop_generator(f"query about {node_ids[0]}", max_hops, None, task_id))
+            hop_events = [e for e in events if e["type"] == "hop"]
+            done = next(e for e in events if e["type"] == "done")
+
+            # Hop count never exceeds max_hops.
+            assert len(hop_events) <= max_hops
+
+            # Early exit only fires once a hop's own grounding score met the threshold.
+            if done["stop_reason"] == "grounded":
+                assert hop_events[-1]["grounding"] >= eng.grounding_threshold
+
+            # Chain invariant: each hop's source is the previous hop's target —
+            # proves real frontier-to-frontier traversal, not a repeated
+            # unrestricted global query disconnected from prior hops.
+            selected_pairs = set()
+            for h1, h2 in zip(hop_events, hop_events[1:]):
+                src2 = h2["path"].split(" --")[0]
+                tgt1 = h1["path"].split("--> ")[1]
+                assert src2 == tgt1
+            for h in hop_events:
+                src = h["path"].split(" --")[0]
+                tgt = h["path"].split("--> ")[1]
+                selected_pairs.add((src, tgt))
+
+            # No expired or superseded relation is ever selected.
+            assert not (selected_pairs & expired)
+            assert not (selected_pairs & superseded)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

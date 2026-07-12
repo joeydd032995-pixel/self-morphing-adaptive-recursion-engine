@@ -164,6 +164,8 @@ class PoGResponse(BaseModel):
     result: str
     confidence: float
     verified: bool
+    task_id: Optional[str] = None
+    stop_reason: Optional[str] = None
 
 class TeachRequest(BaseModel):
     background: Optional[bool] = True
