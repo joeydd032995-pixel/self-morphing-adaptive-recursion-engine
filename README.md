@@ -33,6 +33,7 @@ Docker (full stack with Neo4j) and Kubernetes are in [Deployment](#deployment). 
 ## Table of Contents
 - [Overview](#overview)
 - [Key Features](#key-features)
+- [Use Cases & Capabilities](#use-cases--capabilities)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Installation & Dependencies](#installation--dependencies)
@@ -92,6 +93,63 @@ A guiding principle throughout: **heavy or infrastructure-bound capabilities are
 - **FastAPI**: lifespan-managed engine, dependency-injected engine accessor, non-blocking (threadpool-offloaded) handlers, optional rate limiting, structured request logging with `X-Request-ID`, API-key auth, Pydantic-validated bodies, and truthful capability flags.
 - **Observability**: a Prometheus `/metrics` exposition endpoint and provisioned Grafana dashboards.
 - **CLI**, Docker/Compose, Kubernetes manifests, and audit/DOT-graph exports.
+
+## Use Cases & Capabilities
+
+### Where it fits
+
+| Use case | How the engine helps | Key pieces |
+|---|---|---|
+| **Domain Q&A / knowledge assistant** | Ingest your docs, then answer questions grounded in retrieved context with confidence scoring. | `ingest_documents` → `retrieve_context_advanced` → `pog_plan_and_reason` |
+| **Troubleshooting / root-cause analysis** | Decompose a problem into sub-objectives and walk multi-hop entity/relation paths in the knowledge graph. | PoG planning + `kg_relations` + agentic multi-hop retrieval |
+| **Self-improving agent / router** | Route queries by hybrid similarity and let the background loop learn new vocabulary and graph structure over time, gated by verification. | `hybrid_similarity` + `self_teaching_loop` + verifiers |
+| **Structured knowledge base** | Extract entities/relations on ingest and mirror them to a real Neo4j graph for Cypher analytics and multi-hop queries. | entity extraction + `kg_sync_to_neo4j` / `kg_sync_from_neo4j` |
+| **Graph-ML research on reasoning graphs** | Train a GNN over the live morphic graph to classify node roles and predict likely next links (dynamic paths). | `build_graph_tensors` + `train_gnn` + `gnn_predict_links` |
+| **Production microservice** | Expose the whole thing as an authenticated, rate-limited, observable HTTP API. | FastAPI service + Prometheus `/metrics` + Grafana |
+
+### Simple capabilities (a few lines, base install)
+
+These work out of the box with only the required dependencies — no external services, no GPU, deterministic:
+
+```python
+from organized_self_morphing_engine import ProductionAdaptiveEngine
+engine = ProductionAdaptiveEngine(target_solution_text="Compute Analytics")
+
+# 1. Fuzzy + semantic similarity (typo-robust, 0–100)
+engine.hybrid_similarity("comput analytics", "compute analytics")   # ~92
+
+# 2. Chunk and ingest text, then retrieve relevant context
+engine.ingest_documents(["Neural networks power deep learning."], strategy="recursive")
+engine.semantic_retrieve_context("deep learning", k=3)
+
+# 3. Plan-on-Graph reasoning with confidence + verification
+engine.pog_plan_and_reason("How to bound recursion explosions?", max_hops=2)
+
+# 4. Inspect operational metrics
+engine.get_metrics_snapshot()
+```
+
+Or entirely from the terminal:
+
+```bash
+python cli.py demo
+python cli.py pog "How to scale self-improving agents?" --max-hops 3
+python cli.py ingest notes.txt --strategy semantic
+python cli.py metrics
+```
+
+### Advanced capabilities (opt-in dependencies / services)
+
+Each unlocks a richer implementation and degrades gracefully to a simpler one when its dependency is absent:
+
+- **Production semantic RAG** — `sentence-transformers` embeddings (model set by `ENGINE_EMBEDDING_MODEL`) + a persistent FAISS index that auto-scales from exact `IndexFlatIP` to approximate **HNSW** past `ENGINE_FAISS_HNSW_THRESHOLD`.
+- **Advanced retrieval** — `retrieve_context_advanced(query, rewrite=True, rerank=True, agentic=True)`: LLM query rewriting, **cross-encoder re-ranking**, and an **agentic multi-hop** loop that gathers context until it's sufficient.
+- **Real knowledge graph** — connect a live **Neo4j** and sync entities/relations both directions via a parameterized Cypher builder; run multi-hop Cypher analytics over what the engine learns.
+- **Learned GNN** — with `torch-geometric`, train a GraphSAGE model for **node classification** and **link prediction**, and let those signals guide where the self-teaching loop attaches new nodes.
+- **Real LLM reasoning** — set `OPENAI_API_KEY` or `GROQ_API_KEY` to replace the deterministic mock for decomposition, reflection, query rewriting, and proposal generation.
+- **Production API** — authenticated, rate-limited (`slowapi`), non-blocking endpoints with structured request logging; a Prometheus `/metrics` endpoint and provisioned Grafana dashboards; Docker Compose and Kubernetes deployment.
+
+> Rule of thumb: the **simple** capabilities give you a working reasoning/RAG engine on a laptop with `pip install`; the **advanced** capabilities turn it into a scalable, observable service backed by real vector search, a graph database, and learned models — without changing your calling code.
 
 ## Architecture
 
