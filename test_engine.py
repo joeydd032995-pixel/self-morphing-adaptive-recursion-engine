@@ -859,8 +859,13 @@ class TestWebSocketStreaming:
     internally) — these tests cover the additive WS surface only."""
 
     def _client(self):
+        # ENGINE_API_KEY only needs to be set for the reload below (it's read
+        # once into a module-level constant), so it's safe to restore/remove
+        # the prior value immediately afterward rather than leaking it for
+        # the rest of the test run.
+        prior_api_key = os.environ.get("ENGINE_API_KEY")
+        os.environ["ENGINE_API_KEY"] = "test-key"
         try:
-            os.environ.setdefault("ENGINE_API_KEY", "test-key")
             import importlib
             import fastapi_server
             importlib.reload(fastapi_server)
@@ -868,6 +873,11 @@ class TestWebSocketStreaming:
             return fastapi_server, TestClient(fastapi_server.app)
         except Exception as e:
             pytest.skip(f"fastapi stack unavailable: {e}")
+        finally:
+            if prior_api_key is None:
+                os.environ.pop("ENGINE_API_KEY", None)
+            else:
+                os.environ["ENGINE_API_KEY"] = prior_api_key
 
     def test_ws_requires_auth_first_message(self):
         mod, client = self._client()

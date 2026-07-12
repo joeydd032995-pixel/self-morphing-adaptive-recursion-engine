@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.security import APIKeyHeader
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -65,6 +65,15 @@ if not API_KEY:
     raise RuntimeError("ENGINE_API_KEY environment variable is required — set it before starting the server.")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
+# Shared ceiling for client-controlled PoG hop counts across /query,
+# /pog/plan, and /ws/pog/plan — bounds how many locked-SQLite hops a single
+# request can force.
+MAX_POG_HOPS = 20
+
+# Max seconds /ws/pog/plan waits for the next hop event before treating the
+# generator as stalled and closing the connection.
+WS_QUEUE_TIMEOUT_SECONDS = float(os.getenv("WS_QUEUE_TIMEOUT_SECONDS", "60"))
+
 # Module-level engine, exposed via a dependency accessor so endpoints depend on
 # get_engine() rather than the global directly — this is the seam a future
 # connection pool / per-request engine would slot into.
@@ -99,12 +108,19 @@ def _rate_limit_key(request: Request) -> str:
     return request.headers.get("X-API-Key") or get_remote_address(request)
 
 
+_RATE_LIMIT_UNITS_PER_MINUTE = {"second": 60, "minute": 1, "hour": 1 / 60}
+
+
 def _parse_rate_limit(spec: str) -> int:
-    """Parse a slowapi-style '120/minute' spec into a per-minute integer,
-    defaulting to 120 on any unexpected format."""
+    """Parse a slowapi-style '120/minute' (or '/second', '/hour') spec into a
+    per-minute integer, matching how slowapi itself interprets the same env
+    var for the HTTP middleware. Defaults to 120 on any unexpected format."""
     try:
-        return int(spec.split("/")[0])
-    except (ValueError, IndexError):
+        count_str, _, unit = spec.partition("/")
+        count = int(count_str)
+        multiplier = _RATE_LIMIT_UNITS_PER_MINUTE[unit.strip().lower()]
+        return max(1, round(count * multiplier))
+    except (ValueError, KeyError):
         return 120
 
 
@@ -184,7 +200,7 @@ def verify_api_key(key: str = Depends(api_key_header)):
 # ---- Pydantic request/response models ----
 class QueryRequest(BaseModel):
     query: str
-    max_hops: Optional[int] = 3
+    max_hops: Optional[int] = Field(default=3, ge=1, le=MAX_POG_HOPS)
     use_pog: Optional[bool] = True
 
 class QueryResponse(BaseModel):
@@ -295,6 +311,8 @@ async def pog_plan_ws(websocket: WebSocket, eng: ProductionAdaptiveEngine = Depe
 
     try:
         first_message = await websocket.receive_json()
+    except WebSocketDisconnect:
+        return
     except Exception:
         await websocket.close(code=4400)
         return
@@ -318,18 +336,31 @@ async def pog_plan_ws(websocket: WebSocket, eng: ProductionAdaptiveEngine = Depe
         max_hops = int(first_message.get("max_hops", 3))
     except (TypeError, ValueError):
         max_hops = 3
+    if not 1 <= max_hops <= MAX_POG_HOPS:
+        await websocket.close(code=4400)
+        return
     as_of = first_message.get("as_of")
     task_id = str(uuid.uuid4())[:8]
 
     q: "thread_queue.Queue" = thread_queue.Queue()
+    stop_producing = threading.Event()
 
     def _produce():
         """Runs in a worker thread (via run_in_executor): drains the sync
         generator and relays each event onto the thread-safe queue. A plain
         queue.Queue is used (not asyncio.Queue) because it's the only safe
-        way to hand events from a worker thread to the event loop's task."""
+        way to hand events from a worker thread to the event loop's task.
+        Checks stop_producing between hops (the natural pause point for a
+        generator) so an abandoned connection stops requesting further hops;
+        a hop already in flight when stop is requested still runs to
+        completion since Python can't preempt a worker thread mid-call."""
         try:
-            for event in eng._pog_hop_generator(query, max_hops, as_of, task_id):
+            hop_iter = iter(eng._pog_hop_generator(query, max_hops, as_of, task_id))
+            while not stop_producing.is_set():
+                try:
+                    event = next(hop_iter)
+                except StopIteration:
+                    break
                 q.put(event)
         except Exception as e:
             logger.exception("pog_plan_ws generator failed")
@@ -342,17 +373,27 @@ async def pog_plan_ws(websocket: WebSocket, eng: ProductionAdaptiveEngine = Depe
 
     try:
         while True:
-            event = await asyncio.to_thread(q.get)
+            try:
+                # q.get(block=True, timeout=...) bounds the worker-thread wait
+                # itself (unlike wrapping an untimed q.get() in
+                # asyncio.wait_for, which would abandon the async wait but
+                # leave the executor thread blocked indefinitely).
+                event = await asyncio.to_thread(q.get, True, WS_QUEUE_TIMEOUT_SECONDS)
+            except thread_queue.Empty:
+                logger.warning("pog_plan_ws: timed out waiting for hop event, closing (task_id=%s)", task_id)
+                await websocket.close(code=1011)
+                return
             if event is None:
                 break
             await websocket.send_json(event)
     except WebSocketDisconnect:
         return
     finally:
+        stop_producing.set()
         try:
             await websocket.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("pog_plan_ws: close on already-closed socket: %s", e)
 
 @app.post("/rag/ingest", tags=["RAG"])
 async def rag_ingest(request: IngestRequest, api_key: str = Depends(verify_api_key),
