@@ -273,10 +273,30 @@ class ProductionAdaptiveEngine:
                 value TEXT
             )
         ''')
-        
+
+        # Bitemporal fields: valid-time (when a fact was/is true) and
+        # transaction-time (when the system asserted/superseded that belief).
+        # Added via migration since SQLite has no ADD COLUMN IF NOT EXISTS.
+        self._add_column_if_missing(cursor, 'kg_entities', 'created_at', 'TEXT')
+        self._add_column_if_missing(cursor, 'kg_entities', 'updated_at', 'TEXT')
+        self._add_column_if_missing(cursor, 'kg_relations', 'valid_from', 'TEXT')
+        self._add_column_if_missing(cursor, 'kg_relations', 'valid_to', 'TEXT')
+        self._add_column_if_missing(cursor, 'kg_relations', 'tx_start', 'TEXT')
+        self._add_column_if_missing(cursor, 'kg_relations', 'tx_end', 'TEXT')
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_kg_relations_source ON kg_relations(source_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_kg_relations_tx_current ON kg_relations(source_id, tx_end)')
+
         conn.commit()
         conn.close()
         print(f"✅ [DB] SQLite persistence initialized at {self.db_path} (advanced KG schema + RAG support enabled)")
+
+    @staticmethod
+    def _add_column_if_missing(cursor, table, column, coltype):
+        """Idempotently add a column to an existing table (SQLite has no ADD COLUMN IF NOT EXISTS)."""
+        existing_cols = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+        if column not in existing_cols:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     def _load_synonyms_from_db(self):
         """Load persisted synonyms on engine startup for full persistence."""
@@ -399,40 +419,87 @@ class ProductionAdaptiveEngine:
         return cleaned or "RELATED_TO"
 
     @classmethod
-    def build_entity_merge(cls, entity_id, label, properties):
+    def build_entity_merge(cls, entity_id, label, properties, created_at=None, updated_at=None):
         """Build a parameterized Cypher MERGE for an entity node.
         Returns (query, params). Pure — no driver required (unit-testable)."""
         query = (
             "MERGE (e:Entity {id: $id}) "
-            "SET e.label = $label, e.properties = $properties"
+            "SET e.label = $label, e.properties = $properties, "
+            "e.created_at = $created_at, e.updated_at = $updated_at"
         )
         params = {
             "id": entity_id,
             "label": label,
             "properties": json.dumps(properties) if not isinstance(properties, str) else properties,
+            "created_at": created_at,
+            "updated_at": updated_at,
         }
         return query, params
 
     @classmethod
-    def build_relation_merge(cls, source_id, target_id, relation_type, confidence, properties=None):
-        """Build a parameterized Cypher MERGE for a typed, confidence-scored relation
-        between two entities. The relationship type is sanitized and interpolated
-        (Cypher can't parameterize it); all values are parameterized.
+    def build_relation_merge(cls, source_id, target_id, relation_type, confidence, properties=None,
+                              valid_from=None, valid_to=None, tx_start=None, tx_end=None):
+        """Build a parameterized Cypher MERGE for a typed, confidence-scored, bitemporal
+        relation between two entities. valid_from/valid_to describe when the fact was
+        true in the world; tx_start/tx_end describe when the system asserted/superseded
+        that belief. The relationship type is sanitized and interpolated (Cypher can't
+        parameterize it); all values are parameterized.
         Returns (query, params). Pure — no driver required (unit-testable)."""
         rel = cls._sanitize_rel_type(relation_type)
         query = (
             "MERGE (a:Entity {id: $source_id}) "
             "MERGE (b:Entity {id: $target_id}) "
             f"MERGE (a)-[r:{rel}]->(b) "
-            "SET r.confidence = $confidence, r.properties = $properties"
+            "SET r.confidence = $confidence, r.properties = $properties, "
+            "r.valid_from = $valid_from, r.valid_to = $valid_to, "
+            "r.tx_start = $tx_start, r.tx_end = $tx_end"
         )
         params = {
             "source_id": source_id,
             "target_id": target_id,
             "confidence": confidence,
             "properties": json.dumps(properties or {}),
+            "valid_from": valid_from,
+            "valid_to": valid_to,
+            "tx_start": tx_start,
+            "tx_end": tx_end,
         }
         return query, params
+
+    def kg_assert_relation(self, cursor, source_id, target_id, relation_type, confidence,
+                            properties=None, valid_from=None, valid_to=None):
+        """Insert a new current-belief relation row (tx_start=now(), tx_end=NULL).
+        Bitemporal: valid_from/valid_to describe when the fact was/is true in the
+        world; tx_start/tx_end (set by this method) describe when the system
+        asserted that belief. Call kg_supersede_relation first if this replaces
+        an existing current belief for the same (source, target, relation_type)
+        triple — otherwise both rows would remain 'current' simultaneously."""
+        now = datetime.datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO kg_relations
+                (source_id, target_id, relation_type, properties, confidence,
+                 valid_from, valid_to, tx_start, tx_end)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        ''', (source_id, target_id, relation_type, json.dumps(properties or {}),
+              confidence, valid_from, valid_to, now))
+
+    def kg_supersede_relation(self, source_id, target_id, relation_type, as_of=None):
+        """Close the current-belief row(s) for this triple (tx_end = now(), or
+        `as_of` if given) without deleting them — corrections are append-only so
+        'what did we believe on date X' stays answerable. Returns the number of
+        rows closed."""
+        closed_at = as_of or datetime.datetime.now().isoformat()
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE kg_relations SET tx_end = ?
+                WHERE source_id = ? AND target_id = ? AND relation_type = ? AND tx_end IS NULL
+            ''', (closed_at, source_id, target_id, relation_type))
+            n_closed = cursor.rowcount
+            conn.commit()
+            conn.close()
+        return n_closed
 
     def kg_sync_to_neo4j(self):
         """Push all SQLite KG entities and relations to Neo4j via idempotent MERGE
@@ -446,20 +513,24 @@ class ProductionAdaptiveEngine:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             entities = cursor.execute(
-                "SELECT entity_id, label, properties FROM kg_entities").fetchall()
+                "SELECT entity_id, label, properties, created_at, updated_at FROM kg_entities").fetchall()
             relations = cursor.execute(
-                "SELECT source_id, target_id, relation_type, confidence, properties FROM kg_relations"
+                "SELECT source_id, target_id, relation_type, confidence, properties, "
+                "valid_from, valid_to, tx_start, tx_end FROM kg_relations"
             ).fetchall()
             conn.close()
 
         print(f"🔄 [Neo4j] Syncing {len(entities)} entities + {len(relations)} relations to Neo4j...")
         with self.neo4j_driver.session() as session:
-            for entity_id, label, properties in entities:
-                q, p = self.build_entity_merge(entity_id, label, properties or "{}")
+            for entity_id, label, properties, created_at, updated_at in entities:
+                q, p = self.build_entity_merge(
+                    entity_id, label, properties or "{}", created_at=created_at, updated_at=updated_at)
                 session.run(q, **p)
-            for source_id, target_id, rel_type, confidence, properties in relations:
+            for (source_id, target_id, rel_type, confidence, properties,
+                 valid_from, valid_to, tx_start, tx_end) in relations:
                 q, p = self.build_relation_merge(
-                    source_id, target_id, rel_type, confidence, properties)
+                    source_id, target_id, rel_type, confidence, properties,
+                    valid_from=valid_from, valid_to=valid_to, tx_start=tx_start, tx_end=tx_end)
                 session.run(q, **p)
         print("✅ [Neo4j] Sync-to complete.")
         return {"synced": True, "entities": len(entities), "relations": len(relations)}
@@ -467,41 +538,54 @@ class ProductionAdaptiveEngine:
     def kg_sync_from_neo4j(self):
         """Pull entities and relations from Neo4j back into the SQLite KG so the two
         stores stay consistent (bidirectional sync). Upserts entities and inserts
-        relations that are not already present. Returns a dict summary."""
+        current-belief relations that are not already present. Returns a dict summary."""
         if not getattr(self, "has_neo4j", False) or getattr(self, "neo4j_driver", None) is None:
             print("Using SQLite KG backend (Neo4j not connected).")
             return {"synced": False, "entities": 0, "relations": 0}
 
         with self.neo4j_driver.session() as session:
             ent_records = list(session.run(
-                "MATCH (e:Entity) RETURN e.id AS id, e.label AS label, e.properties AS properties"))
+                "MATCH (e:Entity) RETURN e.id AS id, e.label AS label, e.properties AS properties, "
+                "e.created_at AS created_at, e.updated_at AS updated_at"))
             rel_records = list(session.run(
                 "MATCH (a:Entity)-[r]->(b:Entity) "
                 "RETURN a.id AS source_id, b.id AS target_id, type(r) AS relation_type, "
-                "r.confidence AS confidence, r.properties AS properties"))
+                "r.confidence AS confidence, r.properties AS properties, "
+                "r.valid_from AS valid_from, r.valid_to AS valid_to, "
+                "r.tx_start AS tx_start, r.tx_end AS tx_end"))
 
         n_ent = n_rel = 0
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            now = datetime.datetime.now().isoformat()
             for rec in ent_records:
+                existing = cursor.execute(
+                    "SELECT created_at FROM kg_entities WHERE entity_id = ?", (rec["id"],)).fetchone()
+                created_at = (existing[0] if existing and existing[0] else None) or rec.get("created_at") or now
                 cursor.execute('''
-                    INSERT OR REPLACE INTO kg_entities (entity_id, label, properties, source)
-                    VALUES (?, ?, ?, ?)
-                ''', (rec["id"], rec.get("label"), rec.get("properties") or "{}", "neo4j"))
+                    INSERT OR REPLACE INTO kg_entities
+                        (entity_id, label, properties, source, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (rec["id"], rec.get("label"), rec.get("properties") or "{}", "neo4j",
+                      created_at, rec.get("updated_at") or now))
                 n_ent += 1
             for rec in rel_records:
-                # Avoid duplicating a relation that already exists.
+                # Avoid duplicating a relation that already exists as a current belief.
                 exists = cursor.execute('''
                     SELECT 1 FROM kg_relations
-                    WHERE source_id=? AND target_id=? AND relation_type=? LIMIT 1
+                    WHERE source_id=? AND target_id=? AND relation_type=? AND tx_end IS NULL LIMIT 1
                 ''', (rec["source_id"], rec["target_id"], rec["relation_type"])).fetchone()
                 if not exists:
                     cursor.execute('''
-                        INSERT INTO kg_relations (source_id, target_id, relation_type, properties, confidence)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO kg_relations
+                            (source_id, target_id, relation_type, properties, confidence,
+                             valid_from, valid_to, tx_start, tx_end)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (rec["source_id"], rec["target_id"], rec["relation_type"],
-                          rec.get("properties") or "{}", rec.get("confidence")))
+                          rec.get("properties") or "{}", rec.get("confidence"),
+                          rec.get("valid_from"), rec.get("valid_to"),
+                          rec.get("tx_start") or now, rec.get("tx_end")))
                     n_rel += 1
             conn.commit()
             conn.close()
@@ -781,29 +865,36 @@ class ProductionAdaptiveEngine:
                 entities.append(cand)
         return entities
 
-    def _store_entities(self, cursor, entities, source):
-        """Upsert entities into kg_entities and record co-occurrence relations."""
+    def _store_entities(self, cursor, entities, source, valid_from=None):
+        """Upsert entities into kg_entities and record co-occurrence relations.
+        valid_from lets a caller (e.g. historical-document ingestion) record
+        facts as valid as of the document's own time rather than ingestion time."""
+        now = datetime.datetime.now().isoformat()
         for ent in entities:
             entity_id = ent.lower().replace(" ", "_")
             emb = self.get_semantic_embedding(ent)
             emb_blob = emb.tobytes() if hasattr(emb, "tobytes") else json.dumps(
                 emb.tolist() if hasattr(emb, "tolist") else list(emb)
             )
+            existing = cursor.execute(
+                "SELECT created_at FROM kg_entities WHERE entity_id = ?", (entity_id,)).fetchone()
+            created_at = (existing[0] if existing and existing[0] else None) or now
             cursor.execute('''
-                INSERT OR REPLACE INTO kg_entities (entity_id, label, properties, embedding, source)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (entity_id, ent, json.dumps({"surface": ent}), emb_blob, source))
+                INSERT OR REPLACE INTO kg_entities
+                    (entity_id, label, properties, embedding, source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (entity_id, ent, json.dumps({"surface": ent}), emb_blob, source, created_at, now))
         # Co-occurrence relations between entities found in the same chunk.
         for a, b in zip(entities, entities[1:]):
-            cursor.execute('''
-                INSERT INTO kg_relations (source_id, target_id, relation_type, properties, confidence)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (a.lower().replace(" ", "_"), b.lower().replace(" ", "_"),
-                  "co_occurs_with", json.dumps({"source": source}), 0.5))
+            self.kg_assert_relation(
+                cursor, a.lower().replace(" ", "_"), b.lower().replace(" ", "_"),
+                "co_occurs_with", 0.5, properties={"source": source}, valid_from=valid_from)
 
-    def ingest_documents(self, documents, strategy="semantic"):
+    def ingest_documents(self, documents, strategy="semantic", document_time=None):
         """Ingest documents into RAG + KG: chunk, embed, and store each chunk in
         rag_chunks, and extract entities/co-occurrence relations into the KG.
+        document_time (optional ISO8601 string) records the extracted facts as
+        valid as of the document's own time rather than ingestion time.
         Returns the total number of chunks ingested (for accurate reporting)."""
         print(f"📥 [RAG] Ingesting {len(documents)} documents with {strategy} chunking...")
         total_chunks = 0
@@ -820,7 +911,7 @@ class ProductionAdaptiveEngine:
                         VALUES (?, ?, ?)
                     ''', (chunk, emb.tobytes() if hasattr(emb, 'tobytes') else json.dumps(emb.tolist()),
                           json.dumps({"source": "ingest", "chunk_id": i, "entities": entities})))
-                    self._store_entities(cursor, entities, source="ingest")
+                    self._store_entities(cursor, entities, source="ingest", valid_from=document_time)
                     conn.commit()
                     conn.close()
                 total_chunks += 1
