@@ -108,7 +108,7 @@ def _rate_limit_key(request: Request) -> str:
     return request.headers.get("X-API-Key") or get_remote_address(request)
 
 
-_RATE_LIMIT_UNITS_PER_MINUTE = {"second": 1 / 60, "minute": 1, "hour": 60}
+_RATE_LIMIT_UNITS_PER_MINUTE = {"second": 60, "minute": 1, "hour": 1 / 60}
 
 
 def _parse_rate_limit(spec: str) -> int:
