@@ -9,6 +9,12 @@ Welcome! This guide will get you running the **Self-Morphing Adaptive Recursion 
 
 ---
 
+> **No API keys needed to start.** The CLI (Option 1) and Python usage (Option 2) work
+> out of the box with a deterministic mock LLM. Set `OPENAI_API_KEY` or `GROQ_API_KEY`
+> (see [`.env.example`](.env.example)) only if you want real PoG planning, self-teaching,
+> and advanced RAG reasoning instead of the mock. The API server (Option 3) additionally
+> requires `ENGINE_API_KEY`.
+
 ## Option 1: CLI (Fastest - Recommended)
 
 ```bash
