@@ -337,6 +337,120 @@ class TestNeo4jSync:
         assert engine.has_neo4j is False
 
 
+class TestBitemporalKG:
+    """Bitemporal (valid-time + transaction-time) fields on kg_entities/kg_relations."""
+
+    def _columns(self, engine, table):
+        conn = sqlite3.connect(engine.db_path)
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        conn.close()
+        return cols
+
+    def test_schema_has_bitemporal_columns(self, engine):
+        assert {"created_at", "updated_at"} <= self._columns(engine, "kg_entities")
+        assert {"valid_from", "valid_to", "tx_start", "tx_end"} <= self._columns(engine, "kg_relations")
+
+    def test_init_db_migration_is_idempotent(self, engine):
+        # Calling _init_db() again on the same db_path must not raise
+        # (SQLite has no ADD COLUMN IF NOT EXISTS — the migration guard is manual).
+        engine._init_db()
+        engine._init_db()
+        assert {"valid_from", "valid_to", "tx_start", "tx_end"} <= self._columns(engine, "kg_relations")
+
+    def test_kg_assert_relation_sets_tx_start_and_leaves_tx_end_null(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        engine.kg_assert_relation(cursor, "a", "b", "related_to", 0.7)
+        conn.commit()
+        row = cursor.execute(
+            "SELECT tx_start, tx_end FROM kg_relations WHERE source_id='a' AND target_id='b'"
+        ).fetchone()
+        conn.close()
+        assert row[1] is None
+        # tx_start must be a parseable ISO8601 timestamp.
+        import datetime as dt
+        dt.datetime.fromisoformat(row[0])
+
+    def test_kg_assert_relation_respects_valid_time_window(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        engine.kg_assert_relation(cursor, "a", "b", "related_to", 0.7,
+                                   valid_from="2020-01-01T00:00:00", valid_to="2021-01-01T00:00:00")
+        conn.commit()
+        row = cursor.execute(
+            "SELECT valid_from, valid_to FROM kg_relations WHERE source_id='a' AND target_id='b'"
+        ).fetchone()
+        conn.close()
+        assert row == ("2020-01-01T00:00:00", "2021-01-01T00:00:00")
+
+    def test_kg_supersede_relation_closes_old_row_before_reassert(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        engine.kg_assert_relation(cursor, "a", "b", "related_to", 0.5)
+        conn.commit()
+        conn.close()
+
+        n_closed = engine.kg_supersede_relation("a", "b", "related_to")
+        assert n_closed == 1
+
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        engine.kg_assert_relation(cursor, "a", "b", "related_to", 0.9)
+        conn.commit()
+        # Exactly one row for this triple should be "current" (tx_end IS NULL) at a time.
+        current = cursor.execute(
+            "SELECT COUNT(*) FROM kg_relations WHERE source_id='a' AND target_id='b' "
+            "AND relation_type='related_to' AND tx_end IS NULL"
+        ).fetchone()[0]
+        total = cursor.execute(
+            "SELECT COUNT(*) FROM kg_relations WHERE source_id='a' AND target_id='b' "
+            "AND relation_type='related_to'"
+        ).fetchone()[0]
+        conn.close()
+        assert current == 1
+        assert total == 2  # old closed row + new current row, history preserved
+
+    def test_cypher_builders_include_bitemporal_params(self, engine):
+        q, p = engine.build_relation_merge(
+            "a", "b", "related_to", 0.5, {"x": 1},
+            valid_from="2020-01-01", valid_to=None, tx_start="2024-01-01", tx_end=None)
+        assert "$valid_from" in q and "$tx_start" in q
+        assert p["valid_from"] == "2020-01-01" and p["tx_start"] == "2024-01-01"
+        assert p["valid_to"] is None and p["tx_end"] is None
+
+        eq, ep = engine.build_entity_merge("paris", "Paris", {"surface": "Paris"},
+                                            created_at="2024-01-01", updated_at="2024-06-01")
+        assert "$created_at" in eq and "$updated_at" in eq
+        assert ep["created_at"] == "2024-01-01" and ep["updated_at"] == "2024-06-01"
+
+    def test_store_entities_preserves_created_at_across_upsert(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        engine._store_entities(cursor, ["Paris", "France"], source="test")
+        conn.commit()
+        first_created = cursor.execute(
+            "SELECT created_at FROM kg_entities WHERE entity_id='paris'").fetchone()[0]
+        assert first_created is not None
+
+        # Re-upserting the same entity must not reset created_at.
+        engine._store_entities(cursor, ["Paris"], source="test")
+        conn.commit()
+        second_created = cursor.execute(
+            "SELECT created_at FROM kg_entities WHERE entity_id='paris'").fetchone()[0]
+        conn.close()
+        assert second_created == first_created
+
+    def test_store_entities_threads_valid_from_into_co_occurrence_relations(self, engine):
+        conn = sqlite3.connect(engine.db_path)
+        cursor = conn.cursor()
+        engine._store_entities(cursor, ["Paris", "France"], source="test", valid_from="2019-05-01")
+        conn.commit()
+        row = cursor.execute(
+            "SELECT valid_from FROM kg_relations WHERE relation_type='co_occurs_with'").fetchone()
+        conn.close()
+        assert row[0] == "2019-05-01"
+
+
 def _sample_graph():
     """A small typed morphic graph exercising all four edge types + a cycle."""
     root = MorphicTextNode("root", "compute analytics pipeline", "linear")
