@@ -370,6 +370,33 @@ async def rag_stats(api_key: str = Depends(verify_api_key),
         logger.exception("rag_stats failed")
         raise HTTPException(status_code=500, detail="Internal server error") from e
 
+@app.get("/cache/stats", tags=["Cache"])
+async def cache_stats(api_key: str = Depends(verify_api_key),
+                      eng: ProductionAdaptiveEngine = Depends(get_engine)):
+    """Semantic cache hit/entry counts per cache_kind (llm_call, rag_retrieve)."""
+    if eng.semantic_cache is None:
+        return {"enabled": False}
+    try:
+        stats = await run_in_threadpool(eng.semantic_cache.stats)
+        return {"enabled": True, "by_kind": stats}
+    except Exception as e:
+        logger.exception("cache_stats failed")
+        raise HTTPException(status_code=500, detail="Internal server error") from e
+
+@app.post("/cache/clear", tags=["Cache", "Admin"])
+async def cache_clear(cache_kind: Optional[str] = None, api_key: str = Depends(verify_api_key),
+                      eng: ProductionAdaptiveEngine = Depends(get_engine)):
+    """Manually invalidate the semantic cache. Omit cache_kind to clear everything,
+    or pass 'llm_call' / 'rag_retrieve' to clear just that kind."""
+    if eng.semantic_cache is None:
+        return {"enabled": False, "cleared": False}
+    try:
+        await run_in_threadpool(eng.semantic_cache.invalidate, cache_kind)
+        return {"enabled": True, "cleared": True, "cache_kind": cache_kind}
+    except Exception as e:
+        logger.exception("cache_clear failed")
+        raise HTTPException(status_code=500, detail="Internal server error") from e
+
 @app.get("/teach/status", tags=["Self-Teaching"])
 async def teach_status(api_key: str = Depends(verify_api_key),
                        eng: ProductionAdaptiveEngine = Depends(get_engine)):

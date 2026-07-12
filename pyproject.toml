@@ -34,4 +34,4 @@ all = [
 morphic = "cli:main"
 
 [tool.setuptools]
-py-modules = ["organized_self_morphing_engine", "fastapi_server", "cli"]
+py-modules = ["organized_self_morphing_engine", "fastapi_server", "cli", "semantic_cache"]

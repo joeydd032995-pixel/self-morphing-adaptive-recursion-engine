@@ -223,6 +223,92 @@ class TestPoGPlanning:
         assert done["task_id"] == wrapper_result["task_id"] == task_id
 
 
+class TestSemanticCache:
+    """Unit tests for the SemanticCache module (semantic_cache.py), plus
+    integration checks for its wiring into llm_call/semantic_retrieve_context."""
+
+    def _cache(self, tmp_path, **kwargs):
+        from semantic_cache import SemanticCache
+        return SemanticCache(str(tmp_path / "cache.db"), **kwargs)
+
+    def test_miss_then_hit_exact(self, tmp_path):
+        cache = self._cache(tmp_path)
+        assert cache.get("llm_call", "hello", [1.0, 0.0, 0.0]) is None
+        cache.put("llm_call", "hello", [1.0, 0.0, 0.0], {"content": "world"})
+        assert cache.get("llm_call", "hello", [1.0, 0.0, 0.0]) == {"content": "world"}
+
+    def test_hit_on_near_duplicate_embedding(self, tmp_path):
+        cache = self._cache(tmp_path, threshold=90.0)
+        cache.put("llm_call", "query A", [1.0, 0.0, 0.0], {"content": "A"})
+        # Different text, but a near-identical embedding (cosine similarity ~99%).
+        near = [0.99, 0.14, 0.0]
+        assert cache.get("llm_call", "query B (paraphrase)", near) == {"content": "A"}
+
+    def test_miss_below_threshold(self, tmp_path):
+        cache = self._cache(tmp_path, threshold=90.0)
+        cache.put("llm_call", "query A", [1.0, 0.0, 0.0], {"content": "A"})
+        orthogonal = [0.0, 1.0, 0.0]  # 0% similarity
+        assert cache.get("llm_call", "query B", orthogonal) is None
+
+    def test_ttl_expiry(self, tmp_path):
+        cache = self._cache(tmp_path, ttl_seconds=0)
+        cache.put("llm_call", "hello", [1.0, 0.0, 0.0], {"content": "world"})
+        assert cache.get("llm_call", "hello", [1.0, 0.0, 0.0]) is None
+
+    def test_invalidate_by_kind(self, tmp_path):
+        cache = self._cache(tmp_path)
+        cache.put("llm_call", "a", [1.0, 0.0], {"v": 1})
+        cache.put("rag_retrieve", "b", [1.0, 0.0], {"v": 2})
+        cache.invalidate("llm_call")
+        assert cache.get("llm_call", "a", [1.0, 0.0]) is None
+        assert cache.get("rag_retrieve", "b", [1.0, 0.0]) == {"v": 2}
+
+    def test_invalidate_all(self, tmp_path):
+        cache = self._cache(tmp_path)
+        cache.put("llm_call", "a", [1.0, 0.0], {"v": 1})
+        cache.put("rag_retrieve", "b", [1.0, 0.0], {"v": 2})
+        cache.invalidate()
+        assert cache.get("llm_call", "a", [1.0, 0.0]) is None
+        assert cache.get("rag_retrieve", "b", [1.0, 0.0]) is None
+
+    def test_stats_counts_entries_and_hits(self, tmp_path):
+        cache = self._cache(tmp_path)
+        cache.put("llm_call", "a", [1.0, 0.0], {"v": 1})
+        cache.get("llm_call", "a", [1.0, 0.0])
+        cache.get("llm_call", "a", [1.0, 0.0])
+        stats = cache.stats()
+        assert stats["llm_call"]["entries"] == 1
+        assert stats["llm_call"]["hits"] == 2
+
+    def test_llm_call_cache_hit_is_deterministic(self, engine):
+        # The mock LLM's non-json response is randomized per call; a cache hit
+        # must return the exact same response rather than re-randomizing.
+        r1 = engine.llm_call("a fixed unique prompt for caching test")
+        r2 = engine.llm_call("a fixed unique prompt for caching test")
+        assert r1 == r2
+
+    def test_llm_call_use_cache_false_bypasses_cache(self, engine):
+        engine.llm_call("another fixed prompt not to be cached", use_cache=False)
+        conn = sqlite3.connect(engine.db_path)
+        row = conn.execute(
+            "SELECT COUNT(*) FROM semantic_cache WHERE query_text = ?",
+            ("another fixed prompt not to be cached",)).fetchone()
+        conn.close()
+        assert row[0] == 0
+
+    def test_admin_edit_mapping_invalidates_llm_call_cache(self, engine):
+        engine.llm_call("prompt to be cached before edit", json_mode=True)
+        assert engine.semantic_cache.stats().get("llm_call", {}).get("entries", 0) >= 1
+        engine.admin_edit_mapping("testword", "compute_token")
+        assert engine.semantic_cache.stats().get("llm_call", {}).get("entries", 0) == 0
+
+    def test_ingest_invalidates_rag_retrieve_cache(self, engine):
+        engine.semantic_retrieve_context("some rag query")
+        assert engine.semantic_cache.stats().get("rag_retrieve", {}).get("entries", 0) >= 1
+        engine.ingest_documents(["Some new document content about analytics."], strategy="fixed")
+        assert engine.semantic_cache.stats().get("rag_retrieve", {}).get("entries", 0) == 0
+
+
 class TestSelfTeachingAndDynamicNodes:
     """Test learning loop and attach_node safety."""
     
