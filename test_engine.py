@@ -853,5 +853,82 @@ class TestFastAPIProduction:
             assert resp.status_code == 422
 
 
+class TestWebSocketStreaming:
+    """Phase 10: real-time PoG visibility over /ws/pog/plan. The REST
+    /pog/plan endpoint is unchanged (it still fully drains the generator
+    internally) — these tests cover the additive WS surface only."""
+
+    def _client(self):
+        try:
+            os.environ.setdefault("ENGINE_API_KEY", "test-key")
+            import importlib
+            import fastapi_server
+            importlib.reload(fastapi_server)
+            from fastapi.testclient import TestClient
+            return fastapi_server, TestClient(fastapi_server.app)
+        except Exception as e:
+            pytest.skip(f"fastapi stack unavailable: {e}")
+
+    def test_ws_requires_auth_first_message(self):
+        mod, client = self._client()
+        with client:
+            with client.websocket_connect("/ws/pog/plan") as ws:
+                ws.send_json({"api_key": "wrong-key", "query": "hello"})
+                with pytest.raises(mod.WebSocketDisconnect) as exc_info:
+                    ws.receive_json()
+                assert exc_info.value.code == 4401
+
+    def test_ws_streams_per_hop_events(self):
+        mod, client = self._client()
+        with client:
+            conn = sqlite3.connect(mod.engine.db_path)
+            cur = conn.cursor()
+            mod.engine.kg_assert_relation(cur, "alpha", "beta", "leads_to", 0.9)
+            mod.engine.kg_assert_relation(cur, "beta", "gamma", "leads_to", 0.9)
+            conn.commit()
+            conn.close()
+            mod.engine.grounding_threshold = 101.0  # force full traversal
+
+            with client.websocket_connect("/ws/pog/plan") as ws:
+                ws.send_json({"api_key": "test-key", "query": "Tell me about Alpha", "max_hops": 3})
+                events = []
+                while True:
+                    msg = ws.receive_json()
+                    events.append(msg)
+                    if msg["type"] == "done":
+                        break
+
+            hop_events = [e for e in events if e["type"] == "hop"]
+            done_event = events[-1]
+            assert len(hop_events) >= 1
+            assert done_event["type"] == "done"
+
+            # The streamed result must match what the sync wrapper returns for
+            # equivalent input against the same seeded KG state.
+            wrapper_result = mod.engine.pog_plan_and_reason("Tell me about Alpha", max_hops=3)
+            assert done_event["result"] == wrapper_result["result"]
+            assert done_event["stop_reason"] == wrapper_result["stop_reason"]
+
+    def test_ws_concurrent_connections_dont_deadlock(self):
+        mod, client = self._client()
+        with client:
+            start = time.time()
+            results = []
+            with client.websocket_connect("/ws/pog/plan") as ws1, \
+                 client.websocket_connect("/ws/pog/plan") as ws2, \
+                 client.websocket_connect("/ws/pog/plan") as ws3:
+                for i, ws in enumerate([ws1, ws2, ws3]):
+                    ws.send_json({"api_key": "test-key", "query": f"concurrent query {i}", "max_hops": 2})
+                for ws in [ws1, ws2, ws3]:
+                    while True:
+                        msg = ws.receive_json()
+                        if msg["type"] == "done":
+                            results.append(msg)
+                            break
+            elapsed = time.time() - start
+            assert len(results) == 3
+            assert elapsed < 20  # generous bound; guards against an actual deadlock
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=line"])

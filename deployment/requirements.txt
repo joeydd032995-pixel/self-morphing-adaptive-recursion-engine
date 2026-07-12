@@ -2,7 +2,7 @@ torch
 numpy
 networkx
 fastapi
-uvicorn
+uvicorn[standard]  # [standard] pulls in the websockets library needed for /ws/pog/plan
 requests
 pytest
 sentence-transformers
